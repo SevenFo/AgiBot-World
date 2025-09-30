@@ -1,13 +1,15 @@
 import math
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 import transformers
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
+from diffusers.schedulers.scheduling_dpmsolver_multistep import (
+    DPMSolverMultistepScheduler,
+)
 from timm.models.vision_transformer import Mlp
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
@@ -67,12 +69,16 @@ class TimestepEmbedder(nn.Module):
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
+            / half
         )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding.to(self.dtype)
 
     def forward(self, t):
@@ -130,7 +136,9 @@ class GO1Model(PreTrainedModel):
         self.patch_size = patch_size
         self.select_layer = config.select_layer
         self.template = config.template
-        self.num_image_token = int((image_size // patch_size) ** 2 * (config.downsample_ratio**2))
+        self.num_image_token = int(
+            (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
+        )
         self.downsample_ratio = config.downsample_ratio
         self.ps_version = config.ps_version
         self.llm_arch_name = config.llm_config.architectures[0]
@@ -147,24 +155,37 @@ class GO1Model(PreTrainedModel):
             if self.vision_model.dtype != self.torch_dtype:
                 self.vision_model.to(self.torch_dtype)
         else:
-            self.vision_model = InternVisionModel(config.vision_config).to(self.torch_dtype)
+            self.vision_model = InternVisionModel(config.vision_config).to(
+                self.torch_dtype
+            )
         if language_model is not None:
             self.language_model = language_model
             if language_model.dtype != self.torch_dtype:
                 self.language_model.to(self.torch_dtype)
         else:
             if "InternLM2ForCausalLM" in config.llm_config.architectures[0]:
-                self.language_model = InternLM2ForCausalLMGO1(config.llm_config).to(self.torch_dtype)
+                self.language_model = InternLM2ForCausalLMGO1(config.llm_config).to(
+                    self.torch_dtype
+                )
             else:
-                raise NotImplementedError(f"{config.llm_config.architectures[0]} is not implemented.")
+                raise NotImplementedError(
+                    f"{config.llm_config.architectures[0]} is not implemented."
+                )
 
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.llm_config.hidden_size
         llm_head_dim = llm_hidden_size // config.llm_config.num_attention_heads
 
         self.mlp1 = nn.Sequential(
-            nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio) ** 2, dtype=self.torch_dtype),
-            nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio) ** 2, llm_hidden_size, dtype=self.torch_dtype),
+            nn.LayerNorm(
+                vit_hidden_size * int(1 / self.downsample_ratio) ** 2,
+                dtype=self.torch_dtype,
+            ),
+            nn.Linear(
+                vit_hidden_size * int(1 / self.downsample_ratio) ** 2,
+                llm_hidden_size,
+                dtype=self.torch_dtype,
+            ),
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size, dtype=self.torch_dtype),
         )
@@ -177,10 +198,14 @@ class GO1Model(PreTrainedModel):
         self.num_samples = 0
 
         if config.use_backbone_lora:
-            self.wrap_backbone_lora(r=config.use_backbone_lora, lora_alpha=2 * config.use_backbone_lora)
+            self.wrap_backbone_lora(
+                r=config.use_backbone_lora, lora_alpha=2 * config.use_backbone_lora
+            )
 
         if config.use_llm_lora:
-            self.wrap_llm_lora(r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora)
+            self.wrap_llm_lora(
+                r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora
+            )
 
         # Action Expert related initialization
         action_config = config.action_config
@@ -212,7 +237,9 @@ class GO1Model(PreTrainedModel):
             [
                 nn.Linear(
                     llm_head_dim,  # 128 to 64
-                    latent_action_head_dim if config.latent_planning else action_head_dim,
+                    latent_action_head_dim
+                    if config.latent_planning
+                    else action_head_dim,
                     dtype=self.torch_dtype,
                 )
                 for _ in range(config.llm_config.num_hidden_layers)
@@ -222,14 +249,20 @@ class GO1Model(PreTrainedModel):
             [
                 nn.Linear(
                     llm_head_dim,
-                    latent_action_head_dim if config.latent_planning else action_head_dim,
+                    latent_action_head_dim
+                    if config.latent_planning
+                    else action_head_dim,
                     dtype=self.torch_dtype,
                 )
                 for _ in range(config.llm_config.num_hidden_layers)
             ]
         )
-        self.time_embedder = TimestepEmbedder(action_hidden_size, dtype=self.torch_dtype)
-        self.freq_embedder = TimestepEmbedder(action_hidden_size, dtype=self.torch_dtype)
+        self.time_embedder = TimestepEmbedder(
+            action_hidden_size, dtype=self.torch_dtype
+        )
+        self.freq_embedder = TimestepEmbedder(
+            action_hidden_size, dtype=self.torch_dtype
+        )
 
         self.state_adaptor = nn.Sequential(
             nn.Linear(
@@ -238,9 +271,17 @@ class GO1Model(PreTrainedModel):
                 dtype=self.torch_dtype,
             ),
             nn.GELU(approximate="tanh"),
-            nn.Linear(action_config.hidden_size, action_config.hidden_size, dtype=self.torch_dtype),
+            nn.Linear(
+                action_config.hidden_size,
+                action_config.hidden_size,
+                dtype=self.torch_dtype,
+            ),
             nn.GELU(approximate="tanh"),
-            nn.Linear(action_config.hidden_size, action_config.hidden_size, dtype=self.torch_dtype),
+            nn.Linear(
+                action_config.hidden_size,
+                action_config.hidden_size,
+                dtype=self.torch_dtype,
+            ),
         )
 
         self.action_adaptor = nn.Sequential(
@@ -250,12 +291,22 @@ class GO1Model(PreTrainedModel):
                 dtype=self.torch_dtype,
             ),
             nn.GELU(approximate="tanh"),
-            nn.Linear(action_config.hidden_size, action_config.hidden_size, dtype=self.torch_dtype),
+            nn.Linear(
+                action_config.hidden_size,
+                action_config.hidden_size,
+                dtype=self.torch_dtype,
+            ),
             nn.GELU(approximate="tanh"),
-            nn.Linear(action_config.hidden_size, action_config.hidden_size, dtype=self.torch_dtype),
+            nn.Linear(
+                action_config.hidden_size,
+                action_config.hidden_size,
+                dtype=self.torch_dtype,
+            ),
         )
 
-        self.final_layer = FinalLayer(action_hidden_size, self.action_dim).to(self.torch_dtype)
+        self.final_layer = FinalLayer(action_hidden_size, self.action_dim).to(
+            self.torch_dtype
+        )
         self.init_linear_weights()
 
         # Noise scheduluar related initialization
@@ -296,10 +347,18 @@ class GO1Model(PreTrainedModel):
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
-        if int(h * scale_factor) / scale_factor != h or int(w * scale_factor) / scale_factor != w:
+        if (
+            int(h * scale_factor) / scale_factor != h
+            or int(w * scale_factor) / scale_factor != w
+        ):
             w_ = int(int(w * scale_factor) / scale_factor)
             h_ = int(int(h * scale_factor) / scale_factor)
-            x = F.interpolate(x.permute(0, 3, 1, 2), size=(w_, h_), mode="bilinear", align_corners=False)
+            x = F.interpolate(
+                x.permute(0, 3, 1, 2),
+                size=(w_, h_),
+                mode="bilinear",
+                align_corners=False,
+            )
             x = x.permute(0, 2, 3, 1).contiguous()
             n, w, h, c = x.size()
         # N, W, H, C --> N, W, H * scale, C // scale
@@ -307,7 +366,12 @@ class GO1Model(PreTrainedModel):
         # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
         x = x.permute(0, 2, 1, 3).contiguous()
         # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
-        x = x.view(n, int(h * scale_factor), int(w * scale_factor), int(c / (scale_factor * scale_factor)))
+        x = x.view(
+            n,
+            int(h * scale_factor),
+            int(w * scale_factor),
+            int(c / (scale_factor * scale_factor)),
+        )
         if self.ps_version == "v1":
             warnings.warn(
                 "In ps_version 'v1', the height and width have not been swapped back, "
@@ -363,7 +427,9 @@ class GO1Model(PreTrainedModel):
         device, dtype = state_traj.device, state_traj.dtype
         # Sample noise that we'll add to the actions
         noisy_action = torch.randn(
-            size=(state_traj.shape[0], self.action_chunk_size, self.action_dim), device=device, dtype=dtype
+            size=(state_traj.shape[0], self.action_chunk_size, self.action_dim),
+            device=device,
+            dtype=dtype,
         )
         # Set step values
         self.noise_scheduler_sample.set_timesteps(self.num_inference_timesteps)
@@ -374,17 +440,25 @@ class GO1Model(PreTrainedModel):
                 t * torch.ones_like(ctrl_freqs, dtype=ctrl_freqs.dtype).to(device)
             )  # (B, 1, C)
             freq_tokens = self.freq_embedder(ctrl_freqs)  # (B, 1, C)
-            state_action_trajs_w_tfps = torch.cat([timestep_tokens, freq_tokens, state_traj, action_traj], dim=1)
+            state_action_trajs_w_tfps = torch.cat(
+                [timestep_tokens, freq_tokens, state_traj, action_traj], dim=1
+            )
 
             # Predict the model output
-            model_output = self.action_model(state_action_trajs_w_tfps, attention_mask, vlm_key_values_downsample)
+            model_output = self.action_model(
+                state_action_trajs_w_tfps, attention_mask, vlm_key_values_downsample
+            )
 
             state_action_output_tokens = model_output[0]
-            action_output_tokens = state_action_output_tokens[:, -self.action_chunk_size :, ...]
+            action_output_tokens = state_action_output_tokens[
+                :, -self.action_chunk_size :, ...
+            ]
             action_output = self.final_layer(action_output_tokens)
 
             # Compute previous actions: x_t -> x_t-1
-            noisy_action = self.noise_scheduler_sample.step(action_output, t, noisy_action).prev_sample
+            noisy_action = self.noise_scheduler_sample.step(
+                action_output, t, noisy_action
+            ).prev_sample
             noisy_action = noisy_action.to(dtype)
 
         return noisy_action
@@ -400,7 +474,9 @@ class GO1Model(PreTrainedModel):
         labels: Optional[torch.LongTensor] = None,
     ) -> CausalLMOutputWithPast:
         # Align with original InternVL implementation style
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         image_flags = image_flags.squeeze(-1)
         input_embeds = self.language_model.get_input_embeddings()(input_ids).clone()
@@ -415,7 +491,9 @@ class GO1Model(PreTrainedModel):
 
         selected = input_ids == self.img_context_token_id
         try:
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
+            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(
+                -1, C
+            )
         except Exception as e:
             vit_embeds = vit_embeds.reshape(-1, C)
             raise ValueError(
@@ -457,11 +535,17 @@ class GO1Model(PreTrainedModel):
             labels=labels,
         )
         # Project vlm kv_cache head dim into action expert head dim
-        vlm_key_values = vlm_outputs.past_key_values  # kv_cache(multi_head) of each decoder layer
+        vlm_key_values = (
+            vlm_outputs.past_key_values
+        )  # kv_cache(multi_head) of each decoder layer
 
         vlm_key_values_downsample = []
-        for vlm_key_value, k_proj, v_proj in zip(vlm_key_values, self.k_proj_layers, self.v_proj_layers):
-            vlm_key_values_downsample.append((k_proj(vlm_key_value[0]), v_proj(vlm_key_value[1])))
+        for vlm_key_value, k_proj, v_proj in zip(
+            vlm_key_values, self.k_proj_layers, self.v_proj_layers
+        ):
+            vlm_key_values_downsample.append(
+                (k_proj(vlm_key_value[0]), v_proj(vlm_key_value[1]))
+            )
 
         B = input_ids.shape[0]
 
@@ -478,11 +562,17 @@ class GO1Model(PreTrainedModel):
         action_logits = None
         if self.training:
             # Sample noise that we'll add to the actions
-            noise = torch.randn(action_gts.shape, dtype=action_gts.dtype, device=action_gts.device)
-            timesteps = torch.randint(0, self.num_train_timesteps, (B, 1), device=action_gts.device).long()
+            noise = torch.randn(
+                action_gts.shape, dtype=action_gts.dtype, device=action_gts.device
+            )
+            timesteps = torch.randint(
+                0, self.num_train_timesteps, (B, 1), device=action_gts.device
+            ).long()
             timestep_tokens = self.time_embedder(timesteps)  # (B, 1, C)
             freq_tokens = self.freq_embedder(ctrl_freqs)  # (B, 1, C)
-            noisy_action = self.noise_scheduler.add_noise(action_gts, noise, timesteps)  # (B, H, C)
+            noisy_action = self.noise_scheduler.add_noise(
+                action_gts, noise, timesteps
+            )  # (B, H, C)
 
             state_trajs = self.state_adaptor(state)
             action_trajs = self.action_adaptor(noisy_action)
@@ -499,15 +589,22 @@ class GO1Model(PreTrainedModel):
                     (
                         attention_mask,
                         torch.ones(
-                            B, self.latent_planner.latent_token_nums, dtype=torch.bool, device=attention_mask.device
+                            B,
+                            self.latent_planner.latent_token_nums,
+                            dtype=torch.bool,
+                            device=attention_mask.device,
                         ),
                     ),
                     dim=1,
                 )
 
-            outputs = self.action_model(state_action_trajs_w_tfps, attention_mask, vlm_key_values_downsample)
+            outputs = self.action_model(
+                state_action_trajs_w_tfps, attention_mask, vlm_key_values_downsample
+            )
             state_action_output_tokens = outputs[0]
-            action_output_tokens = state_action_output_tokens[:, -self.action_chunk_size :, ...]
+            action_output_tokens = state_action_output_tokens[
+                :, -self.action_chunk_size :, ...
+            ]
             action_logits = self.final_layer(action_output_tokens)
 
             # Calculate action mse loss using output action chunk
@@ -521,7 +618,13 @@ class GO1Model(PreTrainedModel):
             if self.enable_lam:
                 vlm_key_values_downsample = latent_vlm_key_values_downsample
                 attention_mask = torch.cat(
-                    (attention_mask, torch.ones(B, 4, dtype=torch.bool, device=attention_mask.device)), dim=1
+                    (
+                        attention_mask,
+                        torch.ones(
+                            B, 4, dtype=torch.bool, device=attention_mask.device
+                        ),
+                    ),
+                    dim=1,
                 )
 
             action_logits = self.condition_sample(

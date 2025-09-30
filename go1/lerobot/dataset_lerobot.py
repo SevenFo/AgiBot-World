@@ -158,7 +158,7 @@ class WrappedLeRobotDataset:
                             norm_stats=self.stats, key=[self.action_key, self.state_key]
                         )
                     )
-                elif t["type"] in ["SelectDim"]:
+                elif t["type"] in ["SelectDim", "Padding"]:
                     trans_funcs.append(
                         getattr(go1dt, t["type"])(
                             **{k: v for k, v in t.items() if k != "type"}

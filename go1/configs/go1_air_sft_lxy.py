@@ -31,22 +31,22 @@ class DatasetArguments(BaseDatasetArguments):
                 key="observation.state",
                 index=([0, 1, 2, 3, 4, 5, -1], ...),
             ),
-            # 将 state 从 7 维 padding 到 14 维以匹配预训练模型
-            dict(
-                type="Padding",
-                key="observation.state",
-                target_shape=14,
-                target_dim=-1,
-                pad_value=0.0,
-            ),
-            # 将 action 从 7 维 padding 到 14 维以匹配预训练模型
-            dict(
-                type="Padding",
-                key="action",
-                target_shape=14,
-                target_dim=-1,
-                pad_value=0.0,
-            ),
+            # # 将 state 从 7 维 padding 到 14 维以匹配预训练模型
+            # dict(
+            #     type="Padding",
+            #     key="observation.state",
+            #     target_shape=14,
+            #     target_dim=-1,
+            #     pad_value=0.0,
+            # ),
+            # # 将 action 从 7 维 padding 到 14 维以匹配预训练模型
+            # dict(
+            #     type="Padding",
+            #     key="action",
+            #     target_shape=14,
+            #     target_dim=-1,
+            #     pad_value=0.0,
+            # ),
         ],
     )
 
@@ -88,8 +88,8 @@ class GOTrainingArguments(TrainingArguments):
 
 @dataclass
 class SpaceArguments(BaseSpaceArguments):
-    state_dim: int = field(default=14)  # 恢复为14，匹配预训练模型 + padding后的维度
-    action_dim: int = field(default=14)
+    state_dim: int = field(default=7)  # 恢复为14，匹配预训练模型 + padding后的维度
+    action_dim: int = field(default=7)
     space_repack: dict = field(
         default_factory=lambda: {
             "state": "observation.state",
