@@ -43,7 +43,9 @@ def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
     assert chw_float32_torch.dtype == torch.float32
     assert chw_float32_torch.ndim == 3
     c, h, w = chw_float32_torch.shape
-    assert c < h and c < w, f"Expect channel first images, but instead {chw_float32_torch.shape}"
+    assert c < h and c < w, (
+        f"Expect channel first images, but instead {chw_float32_torch.shape}"
+    )
 
     if c == 1:
         # If depth image, clip and normalize the depth map just for visualization
@@ -58,7 +60,9 @@ def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
         hwc_uint8_numpy = (colored_depth_image[:, :, :3] * 255).astype(np.uint8)
     else:
         # If RGB image
-        hwc_uint8_numpy = (chw_float32_torch * 255).type(torch.uint8).permute(1, 2, 0).numpy()
+        hwc_uint8_numpy = (
+            (chw_float32_torch * 255).type(torch.uint8).permute(1, 2, 0).numpy()
+        )
 
     return hwc_uint8_numpy
 
@@ -75,9 +79,9 @@ def visualize_dataset(
     output_dir: Path | None = None,
 ) -> Path | None:
     if save:
-        assert (
-            output_dir is not None
-        ), "Set an output directory where to write .rrd files with `--output-dir path/to/directory`."
+        assert output_dir is not None, (
+            "Set an output directory where to write .rrd files with `--output-dir path/to/directory`."
+        )
 
     repo_id = dataset.repo_id
 
@@ -111,8 +115,8 @@ def visualize_dataset(
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
         # iterate over the batch
         for i in range(len(batch["index"])):
-            rr.set_time_sequence("frame_index", batch["frame_index"][i].item())
-            rr.set_time_seconds("timestamp", batch["timestamp"][i].item())
+            rr.set_time("frame_index", sequence=batch["frame_index"][i].item())
+            rr.set_time("timestamp", timestamp=batch["timestamp"][i].item())
 
             # display each camera image
             for key in dataset.meta.camera_keys:
@@ -122,12 +126,12 @@ def visualize_dataset(
             # display each dimension of action space (e.g. actuators command)
             if "action" in batch:
                 for dim_idx, val in enumerate(batch["action"][i]):
-                    rr.log(f"action/{dim_idx}", rr.Scalar(val.item()))
+                    rr.log(f"action/{dim_idx}", rr.Scalars(val.item()))
 
             # display each dimension of observed state space (e.g. agent position in joint space)
             if "observation.state" in batch:
                 for dim_idx, val in enumerate(batch["observation.state"][i]):
-                    rr.log(f"state/{dim_idx}", rr.Scalar(val.item()))
+                    rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
 
     if mode == "local" and save:
         # save .rrd locally
@@ -200,13 +204,13 @@ def main():
     parser.add_argument(
         "--web-port",
         type=int,
-        default=9090,
+        default=19090,
         help="Web port for rerun.io when `--mode distant` is set.",
     )
     parser.add_argument(
         "--ws-port",
         type=int,
-        default=9087,
+        default=19087,
         help="Web socket port for rerun.io when `--mode distant` is set.",
     )
     parser.add_argument(
@@ -219,10 +223,21 @@ def main():
             "Visualize the data by running `rerun path/to/file.rrd` on your local machine."
         ),
     )
+    parser.add_argument(
+        "--repo_id",
+        type=str,
+        default=None,
+        help="Optional custom repo_id for the dataset (default: task_{task_id}).",
+    )
 
     args = parser.parse_args()
     kwargs = vars(args)
-    repo_id = f"agibotworld/task_{kwargs.pop('task_id')}"
+    print(kwargs)
+    if kwargs.get("repo_id") is None:
+        repo_id = f"agibotworld/task_{kwargs.pop('task_id')}"
+    else:
+        kwargs.pop("task_id")
+        repo_id = kwargs.pop("repo_id")
     root = f"{kwargs.pop('dataset_path')}/{repo_id}"
 
     logging.info("Loading dataset")

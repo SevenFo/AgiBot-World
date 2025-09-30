@@ -2,12 +2,24 @@ import os
 from typing import Any, Dict, List
 
 import torch
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata, MultiLeRobotDataset
+from lerobot.common.datasets.lerobot_dataset import (
+    LeRobotDataset,
+    LeRobotDatasetMetadata,
+    MultiLeRobotDataset,
+)
 from PIL import Image
-
 from go1.internvl.train.constants import IMG_END_TOKEN
-from go1.internvl.train.dataset import build_transform, dynamic_preprocess, preprocess_internvl2_5
-from go1.lerobot.dataset_transforms import Normalize, TransformedDataset, make_conversation
+from go1.internvl.train.dataset import (
+    build_transform,
+    dynamic_preprocess,
+    preprocess_internvl2_5,
+)
+import go1.lerobot.dataset_transforms as go1dt
+from go1.lerobot.dataset_transforms import (
+    Normalize,
+    TransformedDataset,
+    make_conversation,
+)
 
 
 def tensor_to_pil(tensor):
@@ -73,7 +85,9 @@ class WrappedLeRobotDataset:
             # Single LeRobotDataset
             root = root[0]
 
-            self.dataset_metas = [LeRobotDatasetMetadata(root=root, repo_id=os.path.basename(root))]
+            self.dataset_metas = [
+                LeRobotDatasetMetadata(root=root, repo_id=os.path.basename(root))
+            ]
 
             # Debug mode: only use the first episode
             episode_ids = None
@@ -85,7 +99,12 @@ class WrappedLeRobotDataset:
                 root=root,
                 episodes=episode_ids,
                 delta_timestamps=(
-                    {self.action_key: [t / self.dataset_metas[0].fps for t in range(action_chunk_size)]}
+                    {
+                        self.action_key: [
+                            t / self.dataset_metas[0].fps
+                            for t in range(action_chunk_size)
+                        ]
+                    }
                     if action_chunk_size > 1
                     else None
                 ),
@@ -105,7 +124,9 @@ class WrappedLeRobotDataset:
 
             self.dataset_metas = []
             for root_path in self.root:
-                ds_meta = LeRobotDatasetMetadata(root=root_path, repo_id=os.path.basename(root_path))
+                ds_meta = LeRobotDatasetMetadata(
+                    root=root_path, repo_id=os.path.basename(root_path)
+                )
                 self.dataset_metas.append(ds_meta)
 
             self.dataset = MultiLeRobotDataset(
@@ -124,9 +145,25 @@ class WrappedLeRobotDataset:
 
         if transforms:
             trans_funcs = []
+            if self.state_key.endswith("]"):
+                self.state_index = int(
+                    self.state_key[
+                        self.state_key.index("[") + 1 : self.state_key.index("]")
+                    ]
+                )
             for t in transforms:
                 if t["type"] == "Normalize":
-                    trans_funcs.append(Normalize(norm_stats=self.stats, key=[self.action_key, self.state_key]))
+                    trans_funcs.append(
+                        Normalize(
+                            norm_stats=self.stats, key=[self.action_key, self.state_key]
+                        )
+                    )
+                elif t["type"] in ["SelectDim"]:
+                    trans_funcs.append(
+                        getattr(go1dt, t["type"])(
+                            **{k: v for k, v in t.items() if k != "type"}
+                        )
+                    )
                 else:
                     raise ValueError(f"Unknown transform: {t}")
 
@@ -137,7 +174,9 @@ class WrappedLeRobotDataset:
                         d, trans_funcs, num_frames=self.dataset._datasets[n].num_frames
                     )
             else:
-                self.dataset = TransformedDataset(self.dataset, trans_funcs, num_frames=self.dataset.num_frames)
+                self.dataset = TransformedDataset(
+                    self.dataset, trans_funcs, num_frames=self.dataset.num_frames
+                )
 
         self.meta = self.dataset_metas[0]
         self.debug = debug
@@ -196,7 +235,10 @@ class WrappedLeRobotDataset:
         num_image_tokens = [num_image_token * num_tile for num_tile in num_tiles]
         ntp_target = raw_target.get("ntp_target", "")
         conversation = [
-            {"from": "human", "value": f"{'<image>'*num_image}{raw_target['final_prompt']}"},
+            {
+                "from": "human",
+                "value": f"{'<image>' * num_image}{raw_target['final_prompt']}",
+            },
             {"from": "gpt", "value": ntp_target},
         ]
         ret = preprocess_internvl2_5(
@@ -212,7 +254,9 @@ class WrappedLeRobotDataset:
         position_ids = ret["attention_mask"].long().cumsum(-1) - 1
         position_ids.masked_fill_(ret["attention_mask"] == 0, 1)
         image_end_token_id = text_tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
-        assert (ret["input_ids"][0] == image_end_token_id).sum() == num_image, "image tokens are truncated"
+        assert (ret["input_ids"][0] == image_end_token_id).sum() == num_image, (
+            "image tokens are truncated"
+        )
 
         # Create the final return dictionary
         final_ret = dict(
@@ -235,21 +279,31 @@ class WrappedLeRobotDataset:
         raw_target = {}
         if "cam_head_color" in self.space_args.space_repack:
             raw_target["cam_head_color"] = tensor_to_pil(
-                raw_data[self.space_args.space_repack["cam_head_color"]].permute(1, 2, 0)
+                raw_data[self.space_args.space_repack["cam_head_color"]].permute(
+                    1, 2, 0
+                )
             )
         if "cam_hand_right_color" in self.space_args.space_repack:
             raw_target["cam_hand_right_color"] = tensor_to_pil(
-                raw_data[self.space_args.space_repack["cam_hand_right_color"]].permute(1, 2, 0)
+                raw_data[self.space_args.space_repack["cam_hand_right_color"]].permute(
+                    1, 2, 0
+                )
             )
         if "cam_hand_left_color" in self.space_args.space_repack:
             raw_target["cam_hand_left_color"] = tensor_to_pil(
-                raw_data[self.space_args.space_repack["cam_hand_left_color"]].permute(1, 2, 0)
+                raw_data[self.space_args.space_repack["cam_hand_left_color"]].permute(
+                    1, 2, 0
+                )
             )
         if "final_prompt" in self.space_args.space_repack:
-            raw_target["final_prompt"] = raw_data[self.space_args.space_repack["final_prompt"]]
+            raw_target["final_prompt"] = raw_data[
+                self.space_args.space_repack["final_prompt"]
+            ]
         else:
             raw_target["final_prompt"] = self.space_args.default_prompt
-        raw_target["final_prompt"] = make_conversation(prompt=raw_target["final_prompt"])
+        raw_target["final_prompt"] = make_conversation(
+            prompt=raw_target["final_prompt"]
+        )
 
         results = self.multi_image_get_item(
             raw_target=raw_target,
@@ -266,7 +320,9 @@ class WrappedLeRobotDataset:
             {
                 "action_gts": action,
                 "state": state,
-                "ctrl_freqs": torch.tensor([self.space_args.ctrl_freq], dtype=torch.float32),
+                "ctrl_freqs": torch.tensor(
+                    [self.space_args.ctrl_freq], dtype=torch.float32
+                ),
             }
         )
         if self.debug:

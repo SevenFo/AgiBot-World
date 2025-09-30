@@ -25,9 +25,17 @@ from accelerate import PartialState
 from PIL import Image, ImageFile, PngImagePlugin
 from transformers import AutoTokenizer, Trainer, TrainingArguments, set_seed
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils.logging import enable_default_handler, enable_explicit_format, set_verbosity
+from transformers.utils.logging import (
+    enable_default_handler,
+    enable_explicit_format,
+    set_verbosity,
+)
 
-from go1.configs.go1_base_cfg import BaseDatasetArguments, BaseModelArguments, BaseSpaceArguments
+from go1.configs.go1_base_cfg import (
+    BaseDatasetArguments,
+    BaseModelArguments,
+    BaseSpaceArguments,
+)
 from go1.internvl.dist_utils import init_dist
 from go1.internvl.model.go1 import GO1Model, GO1ModelConfig
 from go1.internvl.model.go1.configuration_action_expert import ActionExpertConfig
@@ -61,6 +69,24 @@ warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+
+def setup_debug_distributed():
+    """为单进程调试设置分布式环境变量"""
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "12345")
+
+        # 初始化分布式（即使是单进程）
+        torch.distributed.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            init_method="env://",
+            world_size=int(os.environ["WORLD_SIZE"]),
+            rank=int(os.environ["RANK"]),
+        )
 
 
 def exp_info_init(exp_dir: str, cfg_path: str, dist_state: PartialState):
@@ -105,7 +131,9 @@ def build_datasets(
             if hasattr(dataset, "stats"):
                 dataset_stats = deepcopy(dataset.stats)
             else:
-                raise ValueError("Cannot find stats in dataset.dataset or dataset.dataset.meta")
+                raise ValueError(
+                    "Cannot find stats in dataset.dataset or dataset.dataset.meta"
+                )
             for k, v in space_args.space_repack.items():
                 if v in dataset_stats:
                     dataset_stats[k] = dataset_stats.pop(v)
@@ -113,7 +141,9 @@ def build_datasets(
             with open(os.path.join(stats_save_path, "dataset_stats.json"), "w") as f:
                 json.dump(convert(dataset_stats), f)
     else:
-        raise NotImplementedError(f"Unsupported dataset type: {dataset_args.dataset_type}")
+        raise NotImplementedError(
+            f"Unsupported dataset type: {dataset_args.dataset_type}"
+        )
 
     return dataset
 
@@ -249,7 +279,9 @@ def build_go1_model(dataset_args, model_args, training_args, space_args):
     elif training_args.fp16 is True:
         torch_dtype = torch.float16
     else:
-        raise ValueError(f"InternVision only supports bfloat16/float16, but trian args no specified!")
+        raise ValueError(
+            "InternVision only supports bfloat16/float16, but trian args no specified!"
+        )
 
     # Load model state dict from given model safetensor directory
     logger.info("Loading GO1Model...")
@@ -277,7 +309,9 @@ def build_go1_model(dataset_args, model_args, training_args, space_args):
     # Add latent planner related config
     if model_args.latent_planning:
         assert config.latent_planner_config.state_token_num == 0
-        config.latent_planner_config.action_dim = 1  # codebook size is 32, and we need to do cross-entropy loss
+        config.latent_planner_config.action_dim = (
+            1  # codebook size is 32, and we need to do cross-entropy loss
+        )
         config.latent_planning = model_args.latent_planning
 
     model = GO1Model.from_pretrained(
@@ -292,7 +326,9 @@ def build_go1_model(dataset_args, model_args, training_args, space_args):
     patch_size = model.config.vision_config.patch_size
     logger.info(f"model.config.force_image_size: {model.config.force_image_size}")
     logger.info(f"model_args.force_image_size: {model_args.force_image_size}")
-    logger.info(f"model.config.vision_config.image_size: {model.config.vision_config.image_size}")
+    logger.info(
+        f"model.config.vision_config.image_size: {model.config.vision_config.image_size}"
+    )
     if model.config.vision_config.image_size != model_args.force_image_size:
         logger.info(
             f"Resizing position embedding from "
@@ -306,12 +342,17 @@ def build_go1_model(dataset_args, model_args, training_args, space_args):
         )
         model.config.vision_config.image_size = model_args.force_image_size
     model.config.force_image_size = model_args.force_image_size
-    model.num_image_token = int((model_args.force_image_size // patch_size) ** 2 * (model_args.down_sample_ratio**2))
+    model.num_image_token = int(
+        (model_args.force_image_size // patch_size) ** 2
+        * (model_args.down_sample_ratio**2)
+    )
 
     if num_new_tokens > 0:
         model.language_model.resize_token_embeddings(len(tokenizer))
         output_embeddings = model.language_model.get_output_embeddings().weight.data
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
+            dim=0, keepdim=True
+        )
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
         model.config.llm_config.vocab_size = len(tokenizer)
@@ -355,6 +396,7 @@ def main(
     training_args: TrainingArguments,
     space_args: BaseSpaceArguments,
 ):
+    setup_debug_distributed()  # 添加这行
     # Parse input arguments
     # See all possible arguments in src/transformers/training_args.py
     # If use DeepSpeed zero3, init_dist must before HfArgumentParser
@@ -391,13 +433,19 @@ def main(
 
     # Detecting last checkpoint and eventually continue from last checkpoint.
     last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+    if (
+        os.path.isdir(training_args.output_dir)
+        and training_args.do_train
+        and not training_args.overwrite_output_dir
+    ):
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
                 f"Output directory ({training_args.output_dir}) already exists and is not empty. "
                 "Use --overwrite_output_dir to overcome."
             )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+        elif (
+            last_checkpoint is not None and training_args.resume_from_checkpoint is None
+        ):
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
@@ -405,7 +453,9 @@ def main(
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    tokenizer, model = build_go1_model(dataset_args, model_args, training_args, space_args)
+    tokenizer, model = build_go1_model(
+        dataset_args, model_args, training_args, space_args
+    )
 
     # Dataset initialization
     train_dataset = build_datasets(
@@ -423,7 +473,9 @@ def main(
     set_seed(training_args.seed)
 
     # Trianer initialization
-    collator = functools.partial(concat_pad_data_collator_go1, pad_id=tokenizer.pad_token_id)
+    collator = functools.partial(
+        concat_pad_data_collator_go1, pad_id=tokenizer.pad_token_id
+    )
 
     trainer = Trainer(
         model=model,
@@ -436,18 +488,26 @@ def main(
     if dist.get_rank() == 0:
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"Total parameters: {total_params/1e6:.2f}M")
-        logger.info(f"Trainable parameters: {trainable_params/1e6:.2f}M")
-        logger.info(f"Frozen parameters: {(total_params - trainable_params)/1e6:.2f}M")
+        logger.info(f"Total parameters: {total_params / 1e6:.2f}M")
+        logger.info(f"Trainable parameters: {trainable_params / 1e6:.2f}M")
+        logger.info(
+            f"Frozen parameters: {(total_params - trainable_params) / 1e6:.2f}M"
+        )
 
         module_params = {}
         for name, module in model.named_children():
             params = sum(p.numel() for p in module.parameters())
             trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
             if params > 0:
-                module_params[name] = {"total": params, "trainable": trainable, "frozen": params - trainable}
+                module_params[name] = {
+                    "total": params,
+                    "trainable": trainable,
+                    "frozen": params - trainable,
+                }
 
-        sorted_modules = sorted(module_params.items(), key=lambda x: x[1]["total"], reverse=True)
+        sorted_modules = sorted(
+            module_params.items(), key=lambda x: x[1]["total"], reverse=True
+        )
         for name, stats in sorted_modules:
             logger.info(f"{name}:")
             logger.info(
@@ -481,7 +541,9 @@ if __name__ == "__main__":
     parser.add_argument("--cfg_path", help="config path", required=True)
     args = parser.parse_args()
 
-    cfg, dataset_args, model_args, training_args, space_args = get_config_args(args.cfg_path)
+    cfg, dataset_args, model_args, training_args, space_args = get_config_args(
+        args.cfg_path
+    )
 
     main(
         cfg_path=args.cfg_path,
