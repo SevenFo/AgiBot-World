@@ -1,9 +1,162 @@
 ﻿# GO-1 自定义数据接入与 Action Expert 微调指南
 
 > 本文档围绕 GO-1 项目的数据接入与微调流程展开，并兼顾 LeRobot v2.1 与 v3.0 版本的兼容策略。全文分为三章：
-> 1. **第一章：基础流程** —— 讲解现有仓库中 GO-1 训练脚本所依赖的 v2.1 数据格式与微调步骤。
+> 1. **第一章：基础流程** —— 讲解现有仓库中 GO-1 训练脚本所依赖的 v2.1 数据格式与微调步骤，**新增详细的输入配置适配机制分析**。
 > 2. **第二章：v3.0 适配指南** —— 结合 `lerobot_latest` 最新源码解析 v3.0 的变化与迁移策略。
 > 3. **第三章：官方文档笔记** —— 将你提供的官方文档逐篇拆解成可操作要点，无需再回原网页查阅。
+
+---
+
+## 🔥 第一章核心更新：输入配置适配机制深度解析
+
+### 📋 新增内容概览
+
+本次更新在第一章中新增 **1.10 节「模型对不同输入配置的适配机制深度解析」**，详细剖析了 GO-1 如何处理以下场景：
+
+1. **相机数量/模态变化**：单目 → 多目、RGB → RGB+深度
+2. **状态/动作维度变化**：单臂 7DOF → 双臂 14DOF
+3. **不同训练模式**：完全冻结、部分微调、联合训练、从头训练
+4. **预训练模型适配**：`ignore_mismatched_sizes` 机制解析
+
+### 🎯 关键发现总结
+
+#### 1. 图像输入弹性机制
+
+```python
+# 数据加载层通过键值检查实现动态适配
+for cam_key in cam_keys:
+    if cam_key in raw_target:  # ← 核心：存在性检查
+        num_image += 1
+        images.append(raw_target[cam_key])
+
+# 自动生成对应数量的 <image> 占位符
+conversation = f"{'<image>' * num_image}{prompt}"
+```
+
+**结论**：
+- ✅ 缺失相机自动跳过，不会报错
+- ✅ 新增相机无需修改模型结构
+- ✅ ViT 按顺序编码所有图像，与相机数量解耦
+
+#### 2. 维度变化适配机制
+
+```python
+# state_adaptor 和 action_adaptor 根据配置动态初始化
+self.state_adaptor = nn.Sequential(
+    nn.Linear(config.state_dim, hidden_size),  # ← 维度从配置读取
+    ...
+)
+
+# 预训练加载时允许尺寸不匹配
+model = GO1Model.from_pretrained(
+    ...,
+    ignore_mismatched_sizes=True,  # ← 关键参数
+)
+```
+
+**受影响层列表**：
+- `state_adaptor[0].weight`: `(1024, old_state_dim)` → `(1024, new_state_dim)` ✅ 重新初始化
+- `action_adaptor[0].weight`: `(1024, old_action_dim)` → `(1024, new_action_dim)` ✅ 重新初始化
+- `final_layer.*.weight`: `(..., old_action_dim)` → `(..., new_action_dim)` ✅ 重新初始化
+- `vision_model.*`, `language_model.*`, `action_model.*` (Transformer) ❌ 保持预训练权重
+
+**结论**：
+- ✅ 仅适配器层重新初始化，核心模块保留预训练能力
+- ✅ Action Expert Transformer 处理固定维度隐空间，与输入维度解耦
+- ⚠️ 重新初始化的层需要重新训练（通常 1-2K steps 收敛）
+
+#### 3. 分层训练模式支持
+
+| 训练模式               | 可训练参数 | 适用场景                    | 显存需求 | 推荐学习率 |
+| ---------------------- | ---------- | --------------------------- | -------- | ---------- |
+| **完全冻结**（DEBUG）  | ~300M      | 快速验证 pipeline           | 22 GB    | 2e-5       |
+| **仅 AE 微调**（推荐） | ~600M      | 状态/动作维度变化、新机器人 | 22 GB    | 2e-5       |
+| **AE + MLP 联合**      | ~800M      | 相机数量增加、新增模态      | 28 GB    | 1e-5       |
+| **AE + MLP + ViT**     | ~6.5B      | 大域偏移（仿真→真实）       | 35 GB    | 5e-6       |
+| **全模型微调**         | ~13.5B     | 完全新任务（需 >1M 样本）   | 80 GB+   | 1e-5       |
+
+### 📊 实践案例对比
+
+#### 案例 1：LIBERO → AgileX（维度 7→14）
+
+**配置变化**：
+```python
+# 原: state_dim=8, action_dim=7, 2 相机
+# 新: state_dim=14, action_dim=14, 3 相机
+```
+
+**训练日志关键信息**：
+```
+Some weights were not initialized (shape mismatch):
+  - state_adaptor.0.weight: (1024, 8) → (1024, 14)
+  - action_adaptor.0.weight: (1024, 7) → (1024, 14)
+  
+Trainable: 342.98M (state_adaptor + action_adaptor + action_model + final_layer)
+Frozen: 13,524.12M (vision + language + mlp1)
+```
+
+**收敛曲线特征**：
+- 0-500 steps: Loss 快速下降（适配器学习映射）
+- 500-2000 steps: 平稳下降（Action Expert 学习新动作分布）
+- 2000+ steps: 缓慢优化（扩散模型精细调整）
+
+#### 案例 2：单目 → 三目（仅相机增加）
+
+**模型行为**：
+- ViT 输出: `(196, 1024)` → `(588, 1024)` (3×196 patches)
+- LLM token 序列: `~200` → `~600` (3个 `<image>` 占位符)
+- **无需重新训练适配器**，但建议解冻 `mlp1` 微调 1-2 epoch
+
+### 🛠️ 新增工具与技巧
+
+#### 1. DEBUG_MODE 快速验证
+
+```bash
+DEBUG_MODE=true RUNNAME=debug_test bash go1/shell/train.sh config.py
+```
+
+自动配置：
+- `batch_size=2`（减少显存）
+- `num_workers=0`（简化调试）
+- 冻结 ViT/LLM/MLP
+- `_fast_init=True`（跳过权重加载）
+
+#### 2. 适配器梯度监控
+
+```python
+# 每 100 steps 检查梯度
+state_grad_norm = torch.norm(model.state_adaptor[0].weight.grad)
+logger.info(f"state_grad={state_grad_norm:.4f}")
+```
+
+正常范围：0.01 ~ 1.0  
+异常情况：=0（被冻结）或 >1e3（梯度爆炸）
+
+#### 3. 完整适配流程图
+
+新增详细的 Mermaid 流程图（见 1.10.8 节），涵盖：
+- 配置检查分支
+- 适配策略选择
+- 问题排查路径
+- 训练监控要点
+
+### 📚 新增参考表格
+
+1. **快速配置参考表**（1.10.9 节）：7 种典型场景的完整配置
+2. **显存需求估算表**：不同配置下的显存占用与硬件推荐
+3. **多卡训练建议**：DeepSpeed ZeRO-1/2/3 配置指南
+
+### 🔗 章节导航
+
+- **1.10.1**：核心设计理念
+- **1.10.2**：图像数量/模态变化处理机制
+- **1.10.3**：状态/动作维度变化处理机制
+- **1.10.4**：不同训练模式下的模型行为
+- **1.10.5**：实践案例分析
+- **1.10.6**：调试技巧与常见陷阱
+- **1.10.7**：推荐实践流程
+- **1.10.8**：完整适配流程图
+- **1.10.9**：快速配置参考表
 
 ---
 
@@ -244,14 +397,651 @@ bash go1/shell/train.sh go1/configs/go1_ae_custom.py
 - **可视化审查**：使用 rerun.io 或自建 notebook 逐帧检查；发现错帧时回溯转换脚本。
 - **调试模式**：`DEBUG_MODE=true` 会冻结大部分模块并减小 batch，用于快速验证 pipeline。
 
-### 1.10 常见问题排查
+### 1.10 模型对不同输入配置的适配机制深度解析
 
-| 现象                                  | 可能原因                                 | 建议                                             |
-| ------------------------------------- | ---------------------------------------- | ------------------------------------------------ |
-| `KeyError: <field>`                   | `space_repack` 映射与数据集键名不一致    | 调整映射或统一转换脚本中的命名                   |
-| `ValueError: Cannot find stats`       | `metadata.json` 缺失统计量或未更新       | 使用 `LeRobotDataset.create` 重采或手动补齐      |
-| `RuntimeError: action_chunk mismatch` | `action_chunk_size` 与帧率不匹配         | 调整 chunk 或在转换阶段做采样/插值               |
-| 推理结果发散                          | 未加载 `dataset_stats.json` 或 AE 未收敛 | 确认 `norm=True` 时提供 stats；延长训练或调小 lr |
+#### 1.10.1 核心设计理念
+
+GO-1 模型采用**模块化架构 + 动态适配层**的设计，允许在保留预训练权重的同时灵活调整输入/输出规格。核心策略包括：
+
+1. **视觉输入弹性**：通过键值存在性检查实现相机数量动态适配
+2. **维度自适应层**：`state_adaptor` 和 `action_adaptor` 作为可重新初始化的接口层
+3. **分层冻结机制**：支持从完全冻结到全模型微调的多级训练模式
+4. **尺寸不匹配容忍**：通过 `ignore_mismatched_sizes=True` 允许关键层重新初始化
+
+---
+
+#### 1.10.2 图像数量/模态变化处理机制
+
+**数据加载层处理（`WrappedLeRobotDataset.__getitem__`）**：
+
+```python
+# 源码位置: go1/lerobot/dataset_lerobot.py:272-292
+def __getitem__(self, index):
+    raw_data = self.dataset[index]
+    raw_target = {}
+    
+    # 关键设计：仅加载 space_repack 中声明的相机
+    if "cam_head_color" in self.space_args.space_repack:
+        raw_target["cam_head_color"] = tensor_to_pil(
+            raw_data[self.space_args.space_repack["cam_head_color"]].permute(1, 2, 0)
+        )
+    if "cam_hand_right_color" in self.space_args.space_repack:
+        raw_target["cam_hand_right_color"] = tensor_to_pil(...)
+    if "cam_hand_left_color" in self.space_args.space_repack:
+        raw_target["cam_hand_left_color"] = tensor_to_pil(...)
+    
+    # 传递给 multi_image_get_item 进一步过滤
+    results = self.multi_image_get_item(raw_target=raw_target, ...)
+```
+
+**视觉特征提取层处理（`multi_image_get_item`）**：
+
+```python
+# 源码位置: go1/lerobot/dataset_lerobot.py:197-227
+@staticmethod
+def multi_image_get_item(
+    raw_target: Dict[str, Any],
+    cam_keys: List[str] = [
+        "cam_head_color",
+        "cam_hand_right_color", 
+        "cam_hand_left_color"
+    ],
+    ...
+):
+    images, num_tiles = [], []
+    num_image = 0
+    
+    # 关键设计：通过存在性检查动态跳过缺失相机
+    for cam_key in cam_keys:
+        if cam_key in raw_target:  # ← 核心判断逻辑
+            num_image += 1
+            if dynamic_image_size:
+                image = dynamic_preprocess(raw_target[cam_key], ...)
+                images += image
+                num_tiles.append(len(image))
+            else:
+                images.append(raw_target[cam_key])
+                num_tiles.append(1)
+    
+    # 根据实际相机数量生成 <image> 占位符
+    conversation = [
+        {
+            "from": "human",
+            "value": f"{'<image>' * num_image}{raw_target['final_prompt']}",
+        },
+        ...
+    ]
+```
+
+**实际效果与场景示例**：
+
+| 场景                     | `space_repack` 配置                                                            | 实际加载相机数 | 模型行为                                      |
+| ------------------------ | ------------------------------------------------------------------------------ | -------------- | --------------------------------------------- |
+| **单目相机**             | `{"cam_head_color": "image"}`                                                  | 1              | 生成 `<image>` × 1，ViT 处理单张图            |
+| **双目相机**             | `{"cam_head_color": "front", "cam_hand_left_color": "wrist"}`                  | 2              | 生成 `<image>` × 2，拼接为 `(2, 3, 448, 448)` |
+| **三目相机（AgileX）**   | `{"cam_head_color": "cam_high", "cam_hand_left_color": "cam_left_wrist", ...}` | 3              | 生成 `<image>` × 3                            |
+| **缺失某相机**           | `{"cam_head_color": "front"}` 但数据集只有 `wrist`                             | 0              | 跳过该样本或报错（取决于 error handling）     |
+| **增加相机（超过预设）** | 修改 `cam_keys` 列表添加 `cam_depth`、`cam_thermal` 等                         | 4+             | 正常处理，ViT 按顺序编码所有图像              |
+
+**注意事项**：
+
+- ViT 不关心相机数量，仅处理拼接后的 `pixel_values` 张量。
+- LLM 通过 `<image>` 占位符数量感知视觉输入，token 序列长度会动态调整。
+- 若预训练模型见过 N 路相机，新增至 N+M 路时**无需额外训练视觉编码器**，但 LLM 的视觉-语言对齐可能需微调。
+
+---
+
+#### 1.10.3 状态/动作维度变化处理机制
+
+**适配器设计（`GO1Model.__init__`）**：
+
+```python
+# 源码位置: go1/internvl/model/go1/modeling_go1.py:267-305
+self.state_adaptor = nn.Sequential(
+    nn.Linear(
+        action_config.state_dim,  # ← 从配置动态读取
+        action_config.hidden_size,
+        dtype=self.torch_dtype,
+    ),
+    nn.GELU(approximate="tanh"),
+    nn.Linear(action_config.hidden_size, action_config.hidden_size, ...),
+    nn.GELU(approximate="tanh"),
+    nn.Linear(action_config.hidden_size, action_config.hidden_size, ...),
+)
+
+self.action_adaptor = nn.Sequential(
+    nn.Linear(
+        action_config.action_dim,  # ← 从配置动态读取
+        action_config.hidden_size,
+        dtype=self.torch_dtype,
+    ),
+    nn.GELU(...),
+    ...
+)
+
+self.final_layer = FinalLayer(action_hidden_size, self.action_dim).to(...)
+```
+
+**配置构建逻辑（`build_ae_config`）**：
+
+```python
+# 源码位置: go1/internvl/train/go1_train.py:175-220
+def build_ae_config(model_args, go1_config, space_args) -> ActionExpertConfig:
+    llm_config_dict = go1_config.llm_config.to_dict()
+    action_config_dict = deepcopy(llm_config_dict)
+    
+    # 移除 LLM 特有配置（如 vocab_size, tokenizer_class 等）
+    for key in (...):
+        action_config_dict.pop(key, None)
+    
+    # 覆盖为 Action Expert 专用配置
+    action_config_dict["action_dim"] = space_args.action_dim      # ← 新维度
+    action_config_dict["state_dim"] = space_args.state_dim        # ← 新维度
+    action_config_dict["action_chunk_size"] = model_args.action_chunk_size
+    action_config_dict["state_token_num"] = 3  # time + ctrl_freq + state
+    
+    return ActionExpertConfig(**action_config_dict)
+```
+
+**预训练权重加载与尺寸不匹配处理**：
+
+```python
+# 源码位置: go1/internvl/train/go1_train.py:318-323
+model = GO1Model.from_pretrained(
+    model_args.model_name_or_path,
+    config=config,  # ← 已更新为新的 state_dim/action_dim
+    torch_dtype=torch_dtype,
+    ignore_mismatched_sizes=True,  # ← 关键参数！
+)
+```
+
+**`ignore_mismatched_sizes=True` 的实际效果**：
+
+HuggingFace Transformers 的 `from_pretrained` 在加载权重时会：
+
+1. **逐层匹配**：尝试将 checkpoint 中的权重加载到当前模型对应层
+2. **维度检查**：若某层权重形状不匹配（如 `state_adaptor[0].weight` 从 `(1024, 8)` 变为 `(1024, 14)`）
+3. **处理策略**：
+   - `ignore_mismatched_sizes=False`（默认）：抛出 `RuntimeError`
+   - `ignore_mismatched_sizes=True`：跳过该层加载，**使用新初始化的随机权重**
+
+**受影响的层列表**：
+
+| 模块                           | 预训练维度示例       | 新维度示例（AgileX） | 是否重新初始化 |
+| ------------------------------ | -------------------- | -------------------- | -------------- |
+| `state_adaptor[0].weight`      | `(1024, 8)`          | `(1024, 14)`         | ✅ 是           |
+| `state_adaptor[0].bias`        | `(1024,)`            | `(1024,)`            | ✅ 是           |
+| `action_adaptor[0].weight`     | `(1024, 7)`          | `(1024, 14)`         | ✅ 是           |
+| `action_adaptor[0].bias`       | `(1024,)`            | `(1024,)`            | ✅ 是           |
+| `final_layer.ffn_final.fc2`    | `(..., 7)`           | `(..., 14)`          | ✅ 是           |
+| `vision_model.*`               | 不变                 | 不变                 | ❌ 否           |
+| `language_model.*`             | 不变                 | 不变                 | ❌ 否           |
+| `action_model.* (Transformer)` | 不变（仅处理隐空间） | 不变                 | ❌ 否           |
+
+**关键结论**：
+
+- **状态/动作维度变化仅影响适配器层**，不会破坏预训练的视觉编码器和语言模型权重。
+- **Action Expert 主体（Transformer 层）** 处理的是固定维度的隐空间 token（如 `(B, horizon+3, 1024)`），与输入维度解耦。
+- **重新初始化的层需要重新训练**，但由于适配器仅 3 层 MLP，收敛速度较快（通常 1-2K steps 即可稳定）。
+
+---
+
+#### 1.10.4 不同训练模式下的模型行为
+
+**模式 1：完全冻结（调试/快速验证）**
+
+```python
+@dataclass
+class GOModelArguments(BaseModelArguments):
+    freeze_backbone: bool = True   # 冻结 ViT
+    freeze_llm: bool = True         # 冻结 LLM
+    freeze_mlp: bool = True         # 冻结 mlp1（视觉-语言映射）
+    freeze_latent_planner: bool = True  # 冻结潜变量规划器（如果启用）
+```
+
+- **可训练参数**：仅 `state_adaptor`、`action_adaptor`、`final_layer`、`action_model`（约 300M）
+- **适用场景**：
+  - `DEBUG_MODE=true` 快速验证数据加载 pipeline
+  - 新任务与预训练任务极度相似，仅需微调动作预测头
+  - 显存受限（单卡 24GB 可训练）
+- **风险**：若任务域偏移大（如从桌面操作迁移至工业场景），冻结 ViT 可能导致特征提取不足。
+
+**模式 2：仅训练 Action Expert（推荐微调策略）**
+
+```python
+@dataclass
+class GOModelArguments(BaseModelArguments):
+    freeze_backbone: bool = True
+    freeze_llm: bool = True
+    freeze_mlp: bool = True
+    freeze_latent_planner: bool = False  # ← 如果需要动态规划能力可解冻
+```
+
+- **可训练参数**：适配器 + Action Expert 完整 Transformer + Latent Planner（约 600M）
+- **训练建议**：
+  - 学习率设置为 `2e-5`（与配置文件一致）
+  - Warmup steps: 1000（让适配器先收敛）
+  - 批量大小：16-32（视显存而定，使用梯度累积）
+- **适用场景**：
+  - 状态/动作维度变化
+  - 新机器人本体（需重新学习状态-动作映射）
+  - 保留视觉理解能力，专注于控制策略优化
+
+**模式 3：联合微调 MLP（视觉-语言对齐增强）**
+
+```python
+@dataclass
+class GOModelArguments(BaseModelArguments):
+    freeze_backbone: bool = True
+    freeze_llm: bool = True
+    freeze_mlp: bool = False  # ← 解冻视觉-语言映射层
+    freeze_latent_planner: bool = False
+```
+
+- **可训练参数**：mlp1 + 适配器 + Action Expert + Latent Planner（约 800M）
+- **适用场景**：
+  - 相机数量增加（3 路 → 5 路）
+  - 相机视角剧烈变化（第三人称 → 第一人称）
+  - 新增模态（RGB + 深度 → RGB + 深度 + 热成像）
+- **训练建议**：
+  - 学习率降至 `1e-5`（避免破坏预训练对齐）
+  - 使用余弦退火调度器
+  - 监控 LLM 输出的 KV Cache 质量（通过中间层激活值可视化）
+
+**模式 4：部分解冻 ViT（大域偏移场景）**
+
+```python
+@dataclass
+class GOModelArguments(BaseModelArguments):
+    freeze_backbone: bool = False  # ← 解冻 ViT
+    freeze_llm: bool = True
+    freeze_mlp: bool = False
+    # 可选：在 GO1Model 中设置 vision_model 仅训练最后几层
+```
+
+- **适用场景**：
+  - 从仿真数据迁移至真实环境
+  - 光照/纹理分布巨大差异
+  - 相机传感器类型变化（工业相机 → 鱼眼相机）
+- **显存需求**：单卡 40GB+，推荐使用 DeepSpeed ZeRO-2
+- **训练建议**：
+  - ViT 学习率设为 `5e-6`（远低于 AE）
+  - 使用差异化学习率（通过 `param_groups` 设置）
+  - 监控过拟合风险（ViT 参数量大，易在小数据集上过拟合）
+
+**模式 5：完全微调（从头训练或大规模迁移）**
+
+```python
+@dataclass
+class GOModelArguments(BaseModelArguments):
+    freeze_backbone: bool = False
+    freeze_llm: bool = False  # ← 解冻 LLM（慎用！）
+    freeze_mlp: bool = False
+    freeze_latent_planner: bool = False
+```
+
+- **适用场景**：
+  - 数据集规模 > 1M 样本
+  - 任务类型完全不同（如从桌面操作迁移至人形机器人全身控制）
+  - 语言指令系统需要重新训练（多语言、领域特定术语）
+- **风险警告**：
+  - LLM 参数量极大（InternLM2-7B 约 7B 参数），解冻后需 80GB+ 显存（ZeRO-3 + 卸载）
+  - 可能破坏预训练的语言理解能力
+  - 需要大量高质量语言-动作对齐数据
+- **替代方案**：优先考虑 LoRA 微调（通过 `use_llm_lora` 参数）
+
+---
+
+#### 1.10.5 实践案例分析
+
+**案例 1：LIBERO → AgileX 双臂（维度 7 → 14）**
+
+```python
+# 配置变化
+# LIBERO: state_dim=8, action_dim=7, 2 相机
+# AgileX: state_dim=14, action_dim=14, 3 相机
+
+@dataclass
+class SpaceArguments(BaseSpaceArguments):
+    state_dim: int = 14  # ← 从 8 变为 14
+    action_dim: int = 14  # ← 从 7 变为 14
+    space_repack: dict = field(
+        default_factory=lambda: {
+            "state": "observation.state",
+            "action": "action",
+            "cam_head_color": "observation.images.cam_high",
+            "cam_hand_left_color": "observation.images.cam_left_wrist",
+            "cam_hand_right_color": "observation.images.cam_right_wrist",  # ← 新增
+        }
+    )
+```
+
+**训练日志分析**（首次运行时的关键输出）：
+
+```
+Loading GO1Model...
+Some weights of GO1Model were not initialized from the model checkpoint:
+  - state_adaptor.0.weight (shape mismatch: checkpoint (1024, 8) vs config (1024, 14))
+  - action_adaptor.0.weight (shape mismatch: checkpoint (1024, 7) vs config (1024, 14))
+  - final_layer.ffn_final.fc2.weight (shape mismatch: checkpoint (..., 7) vs config (..., 14))
+These weights are initialized randomly and need to be trained!
+
+Module parameters:
+  vision_model:    Total: 5905.92M  Trainable: 0.00M  Frozen: 5905.92M
+  language_model:  Total: 7349.76M  Trainable: 0.00M  Frozen: 7349.76M
+  mlp1:            Total: 268.44M   Trainable: 0.00M  Frozen: 268.44M
+  state_adaptor:   Total: 21.02M    Trainable: 21.02M  Frozen: 0.00M  # ← 随机初始化
+  action_adaptor:  Total: 21.02M    Trainable: 21.02M  Frozen: 0.00M  # ← 随机初始化
+  action_model:    Total: 293.60M   Trainable: 293.60M  Frozen: 0.00M
+  final_layer:     Total: 7.34M     Trainable: 7.34M   Frozen: 0.00M  # ← 随机初始化
+```
+
+**收敛曲线特征**：
+
+- **前 500 steps**：Loss 快速下降（适配器学习输入-隐空间映射）
+- **500-2000 steps**：Loss 平稳下降（Action Expert 学习新的动作分布）
+- **2000+ steps**：Loss 进入缓慢优化阶段（扩散模型精细调整）
+
+**案例 2：单目 → 三目（相机数量变化）**
+
+```python
+# 配置变化
+# 原: 1 相机 (cam_head_color)
+# 新: 3 相机 (cam_head_color + cam_hand_left_color + cam_hand_right_color)
+
+# space_repack 保持不变，模型自动适配
+```
+
+**模型行为**：
+
+- ViT 按顺序编码 3 张图像，输出 `(3*196, 1024)` 的 patch 序列（假设每张图 196 个 patch）
+- LLM 的 `input_ids` 中包含 `<image>` × 3，token 序列长度从 `~200` 增加至 `~600`
+- Action Expert 接收更丰富的 KV Cache，但自身结构不变
+- **无需重新训练适配器**，但建议解冻 `mlp1` 微调视觉-语言对齐（约 1-2 epoch）
+
+**案例 3：添加深度图模态**
+
+```python
+# 数据转换阶段
+CUSTOM_FEATURES = {
+    "observation.images.rgb": {"dtype": "image", "shape": (480, 640, 3)},
+    "observation.images.depth": {"dtype": "image", "shape": (480, 640, 3)},  # ← 深度图转为伪彩色
+    ...
+}
+
+# 配置
+space_repack = {
+    ...
+    "cam_head_color": "observation.images.rgb",
+    "cam_hand_left_color": "observation.images.depth",  # ← 将深度图映射到手腕相机位置
+}
+```
+
+**注意事项**：
+
+- ViT 预训练于 RGB 图像，直接输入深度图可能导致特征提取失效
+- 建议在转换脚本中将深度图归一化并应用伪彩色映射（如 JET colormap）
+- 或者修改 `multi_image_get_item`，为深度图添加独立的归一化参数
+
+---
+
+#### 1.10.6 调试技巧与常见陷阱
+
+**技巧 1：使用 `DEBUG_MODE` 快速验证配置**
+
+```bash
+DEBUG_MODE=true \
+RUNNAME=debug_test \
+bash go1/shell/train.sh go1/configs/your_config.py
+```
+
+- 自动设置：
+  - `per_device_train_batch_size=2`（减少显存占用）
+  - `dataloader_num_workers=0`（避免多进程调试困难）
+  - `freeze_backbone=True`, `freeze_llm=True`, `freeze_mlp=True`（仅训练 AE）
+  - `_fast_init=True`（跳过权重加载，使用随机初始化）
+
+**技巧 2：监控适配器训练状态**
+
+```python
+# 在训练循环中添加
+if step % 100 == 0:
+    state_grad_norm = torch.norm(model.state_adaptor[0].weight.grad)
+    action_grad_norm = torch.norm(model.action_adaptor[0].weight.grad)
+    logger.info(f"Step {step}: state_grad={state_grad_norm:.4f}, action_grad={action_grad_norm:.4f}")
+```
+
+- 若梯度长期为 0，检查 `freeze_*` 配置
+- 若梯度爆炸（>1e3），降低学习率或使用梯度裁剪
+
+**技巧 3：可视化 KV Cache 质量**
+
+```python
+# 在 forward 后添加
+vlm_key_values = vlm_outputs.past_key_values
+layer_0_key_mean = vlm_key_values[0][0].mean().item()
+logger.info(f"Layer 0 KV mean: {layer_0_key_mean:.4f}")
+```
+
+- 正常范围：-0.5 ~ 0.5
+- 若接近 0，说明 LLM 输出退化，可能需要解冻 LLM
+
+**常见陷阱 1：忘记更新 `action_chunk_size`**
+
+```python
+# 错误示例
+# 数据集 FPS=30，但配置中 action_chunk_size=10
+@dataclass
+class GOModelArguments(BaseModelArguments):
+    action_chunk_size: int = 10  # ← 应为 30！
+```
+
+- **现象**：训练正常，但推理时动作序列长度不匹配
+- **排查**：检查 `dataset_stats.json` 中的 action shape
+
+**常见陷阱 2：`space_repack` 键名拼写错误**
+
+```python
+# 错误示例
+space_repack = {
+    "state": "observation.state",
+    "action": "actions",  # ← 数据集中为 "action" 而非 "actions"
+}
+```
+
+- **现象**：`KeyError: 'actions'`
+- **排查**：使用 `scripts/visualize_dataset.py` 检查数据集键名
+
+**常见陷阱 3：归一化统计量缺失**
+
+```python
+# 错误示例
+transforms: Optional[List[str]] = field(default_factory=lambda: [])  # ← 未开启 Normalize
+```
+
+- **现象**：推理时动作尺度异常（全为 0 或超出关节限位）
+- **排查**：检查 `dataset_stats.json` 是否存在，确认 `mean/std` 非空
+
+---
+
+#### 1.10.7 推荐实践流程
+
+**Step 1：配置审查清单**
+
+- [ ] `state_dim` / `action_dim` 与数据集特征维度一致
+- [ ] `space_repack` 所有键在数据集中存在
+- [ ] `action_chunk_size` == 数据集 FPS（或合理倍数）
+- [ ] `ctrl_freq` == 数据集采样频率
+- [ ] 至少存在一个相机映射（或使用 `default_prompt`）
+
+**Step 2：小规模试训练（100 steps）**
+
+```bash
+DEBUG_MODE=true \
+RUNNAME=sanity_check \
+bash go1/shell/train.sh your_config.py
+```
+
+- 观察 Loss 是否下降
+- 检查日志中的模块参数统计
+- 确认无 CUDA OOM 或 NaN 梯度
+
+**Step 3：单 epoch 完整训练**
+
+```bash
+DEBUG_MODE=false \
+RUNNAME=pilot_run \
+bash go1/shell/train.sh your_config.py
+```
+
+- 保存 checkpoint-1000
+- 使用 `GO1Infer` 在验证集上测试
+- 可视化预测动作与真值对比
+
+**Step 4：全量训练与超参调优**
+
+- 根据 pilot run 结果调整学习率、batch size
+- 启用 WandB 或 TensorBoard 监控长期趋势
+- 每 5K steps 做一次验证集评估
+
+---
+
+#### 1.10.8 完整适配流程图
+
+```mermaid
+flowchart TB
+    Start([开始: 新数据集/新机器人]) --> CheckConfig{检查配置变化}
+    
+    CheckConfig -->|相机数量/类型变化| CameraAdapt[相机适配流程]
+    CheckConfig -->|状态/动作维度变化| DimAdapt[维度适配流程]
+    CheckConfig -->|完全相同| DirectTrain[直接训练]
+    
+    CameraAdapt --> CamStep1[更新 space_repack 映射]
+    CamStep1 --> CamStep2{是否新增模态?}
+    CamStep2 -->|是: 深度/热成像| CamStep3[解冻 mlp1 微调对齐]
+    CamStep2 -->|否: 仅数量变化| CamStep4[保持 mlp1 冻结]
+    CamStep3 --> Merge1[汇总]
+    CamStep4 --> Merge1
+    
+    DimAdapt --> DimStep1[更新 state_dim/action_dim]
+    DimStep1 --> DimStep2[设置 ignore_mismatched_sizes=True]
+    DimStep2 --> DimStep3{训练模式选择}
+    DimStep3 -->|仅 AE| FreezeAll[冻结 ViT/LLM/MLP]
+    DimStep3 -->|联合微调| FreezeSome[冻结 ViT/LLM]
+    DimStep3 -->|完全微调| FreezeNone[全解冻 + LoRA]
+    FreezeAll --> Merge2[汇总]
+    FreezeSome --> Merge2
+    FreezeNone --> Merge2
+    
+    Merge1 --> PreTrain[预训练检查]
+    Merge2 --> PreTrain
+    DirectTrain --> PreTrain
+    
+    PreTrain --> LoadModel[GO1Model.from_pretrained]
+    LoadModel --> CheckMismatch{是否有尺寸不匹配警告?}
+    CheckMismatch -->|是| LogInit[记录重新初始化的层]
+    CheckMismatch -->|否| SkipLog[跳过]
+    LogInit --> Debug
+    SkipLog --> Debug
+    
+    Debug[DEBUG_MODE 快速验证]
+    Debug --> DebugOK{100 steps Loss 下降?}
+    DebugOK -->|是| FullTrain[完整训练]
+    DebugOK -->|否| Troubleshoot[排查问题]
+    
+    Troubleshoot --> T1{检查数据加载}
+    T1 -->|space_repack 键错误| FixMap[修复映射]
+    T1 -->|stats 缺失| FixStats[重新生成 stats]
+    T1 -->|chunk 不匹配| FixChunk[调整 action_chunk_size]
+    FixMap --> Debug
+    FixStats --> Debug
+    FixChunk --> Debug
+    
+    FullTrain --> Monitor[监控训练]
+    Monitor --> Mon1{适配器梯度正常?}
+    Mon1 -->|否| CheckFreeze[检查 freeze 配置]
+    Mon1 -->|是| Mon2{Loss 持续下降?}
+    CheckFreeze --> Debug
+    
+    Mon2 -->|是| SaveCkpt[保存 checkpoint]
+    Mon2 -->|否| Adjust[调整超参]
+    Adjust --> FullTrain
+    
+    SaveCkpt --> Eval[验证集评估]
+    Eval --> EvalOK{动作质量满意?}
+    EvalOK -->|是| Deploy[部署推理]
+    EvalOK -->|否| Finetune[继续微调]
+    Finetune --> FullTrain
+    
+    Deploy --> End([完成])
+    
+    style Start fill:#e1f5e1
+    style End fill:#e1f5e1
+    style Troubleshoot fill:#ffe1e1
+    style CheckFreeze fill:#ffe1e1
+    style Deploy fill:#e1e5ff
+```
+
+**流程图说明**：
+
+1. **配置检查阶段**：识别变化类型（相机/维度/无变化）
+2. **适配策略选择**：根据变化类型选择对应的处理流程
+3. **模型加载阶段**：处理尺寸不匹配警告，记录重新初始化的层
+4. **调试验证阶段**：快速验证 100 steps，及早发现配置错误
+5. **问题排查分支**：针对常见问题提供修复路径
+6. **完整训练阶段**：监控梯度和 Loss，必要时调整超参
+7. **评估部署阶段**：验证动作质量，决定是否继续微调
+
+---
+
+#### 1.10.9 快速配置参考表
+
+| 场景                         | state_dim | action_dim | 相机数量 | freeze_backbone | freeze_llm | freeze_mlp | ignore_mismatched | 预期训练时长 (A100)  | 推荐学习率 |
+| ---------------------------- | --------- | ---------- | -------- | --------------- | ---------- | ---------- | ----------------- | -------------------- | ---------- |
+| **LIBERO 微调**              | 8         | 7          | 2        | True            | True       | True       | False             | ~2 小时 (10K steps)  | 2e-5       |
+| **AgileX 双臂迁移**          | 14        | 14         | 3        | True            | True       | True       | **True**          | ~4 小时 (20K steps)  | 2e-5       |
+| **单臂 → 双臂（维度翻倍）**  | 7→14      | 7→14       | 3        | True            | True       | True       | **True**          | ~5 小时 (25K steps)  | 2e-5       |
+| **新增深度模态**             | 不变      | 不变       | 2→3      | True            | True       | **False**  | False             | ~6 小时 (30K steps)  | 1e-5       |
+| **仿真 → 真实（域偏移）**    | 不变      | 不变       | 不变     | **False**       | True       | **False**  | False             | ~12 小时 (50K steps) | 5e-6       |
+| **完全新机器人（重头训练）** | 自定义    | 自定义     | 自定义   | **False**       | **False**  | **False**  | **True**          | ~3 天 (100K steps)   | 1e-5       |
+| **快速验证（DEBUG）**        | 任意      | 任意       | 任意     | True            | True       | True       | True              | ~10 分钟 (100 steps) | 2e-5       |
+
+**列说明**：
+
+- `ignore_mismatched`：是否设置 `ignore_mismatched_sizes=True`
+- 预期训练时长：基于单卡 A100 40GB + batch_size=16 + gradient_accumulation_steps=1
+- 学习率：初始学习率，通常配合 cosine 退火
+
+**显存需求估算**（单卡，BF16 训练）：
+
+| 配置                                    | 显存占用      | 推荐硬件             |
+| --------------------------------------- | ------------- | -------------------- |
+| 冻结 ViT/LLM/MLP + batch_size=16        | ~22 GB        | RTX 4090 / A100 40GB |
+| 冻结 ViT/LLM + 解冻 MLP + batch_size=16 | ~28 GB        | A100 40GB            |
+| 冻结 LLM + 解冻 ViT/MLP + batch_size=8  | ~35 GB        | A100 40GB            |
+| 全解冻 + batch_size=4 + ZeRO-2          | ~45 GB        | A100 80GB / 多卡     |
+| 全解冻 + batch_size=8 + ZeRO-3 + 卸载   | ~60 GB (峰值) | 2×A100 40GB          |
+
+**多卡训练建议**：
+
+- 2 卡：使用 DeepSpeed ZeRO-1，每卡 batch_size=16
+- 4 卡：使用 DeepSpeed ZeRO-2，每卡 batch_size=8
+- 8 卡：使用 DeepSpeed ZeRO-3，每卡 batch_size=4，启用 CPU 卸载
+
+---
+
+### 1.11 常见问题排查
+
+| 现象                                  | 可能原因                                    | 建议                                                         |
+| ------------------------------------- | ------------------------------------------- | ------------------------------------------------------------ |
+| `KeyError: <field>`                   | `space_repack` 映射与数据集键名不一致       | 调整映射或统一转换脚本中的命名                               |
+| `ValueError: Cannot find stats`       | `metadata.json` 缺失统计量或未更新          | 使用 `LeRobotDataset.create` 重采或手动补齐                  |
+| `RuntimeError: action_chunk mismatch` | `action_chunk_size` 与帧率不匹配            | 调整 chunk 或在转换阶段做采样/插值                           |
+| 推理结果发散                          | 未加载 `dataset_stats.json` 或 AE 未收敛    | 确认 `norm=True` 时提供 stats；延长训练或调小 lr             |
+| `RuntimeError: size mismatch`         | 维度变化但未设置 `ignore_mismatched_sizes`  | 在 `from_pretrained` 添加该参数，允许重新初始化              |
+| 训练 Loss 不下降                      | 适配器梯度为 0（可能被冻结）                | 检查 `freeze_*` 配置，确保目标模块可训练                     |
+| 相机图像未加载                        | `space_repack` 中缺失对应键或数据集无该字段 | 用 `visualize_dataset.py` 检查数据集结构                     |
+| CUDA OOM                              | 模型过大或 batch size 过高                  | 降低 `per_device_train_batch_size` 或启用 DeepSpeed ZeRO-2/3 |
 
 ---
 

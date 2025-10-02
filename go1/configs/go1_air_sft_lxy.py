@@ -13,6 +13,7 @@ from go1.tools.env_parse import get_bool_env
 
 RUNNAME = os.environ.get("RUNNAME")
 DEBUG_MODE = get_bool_env("DEBUG_MODE")
+RESUME = get_bool_env("RESUME", default=False)
 
 
 @dataclass
@@ -20,7 +21,7 @@ class DatasetArguments(BaseDatasetArguments):
     dataset_type: Optional[str] = field(default="lerobot")
     data_root_dir: Optional[List[str]] = field(
         default_factory=lambda: [
-            "/quick_data/lxy_dataset/lerobot_datasets/09291324",
+            "/quick_data/lxy_dataset/lerobot_datasets/100",
         ],
     )
     transforms: Optional[List[str]] = field(
@@ -64,11 +65,11 @@ class GOModelArguments(BaseModelArguments):
 @dataclass
 class GOTrainingArguments(TrainingArguments):
     output_dir: str = field(default=f"experiment/{RUNNAME}")
-    overwrite_output_dir: bool = field(default=True)
-    dataloader_num_workers: int = field(default=2 if not DEBUG_MODE else 0)  # 20
+    overwrite_output_dir: bool = field(default=RESUME)
+    dataloader_num_workers: int = field(default=8 if not DEBUG_MODE else 0)  # 20
     bf16: bool = field(default=True)
-    num_train_epochs: float = field(default=100.0)
-    per_device_train_batch_size: int = field(default=2 if not DEBUG_MODE else 2)  # 16
+    num_train_epochs: float = field(default=200.0)
+    per_device_train_batch_size: int = field(default=32 if not DEBUG_MODE else 2)  # 16
     gradient_accumulation_steps: int = field(default=1)
     learning_rate: float = field(default=2e-5)
     weight_decay: float = field(default=0.01)
@@ -80,7 +81,7 @@ class GOTrainingArguments(TrainingArguments):
     )  # 推荐使用 stage2 平衡内存和性能
 
     save_strategy: str = field(default="steps")
-    save_steps: int = field(default=10000)
+    save_steps: int = field(default=1000)
     save_total_limit: int = field(default=100)
     logging_steps: int = field(default=10)
     report_to: str = field(default="tensorboard")
@@ -99,5 +100,5 @@ class SpaceArguments(BaseSpaceArguments):
             "final_prompt": "task",
         }
     )
-    ctrl_freq: int = field(default=20)
+    ctrl_freq: int = field(default=10)
     default_prompt: str = field(default="take action to complete the task")

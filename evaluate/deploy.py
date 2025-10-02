@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
+
+import msgpack
+import msgpack_numpy as msgnp
+from fastapi import Response
 import draccus
 import json_numpy
 import numpy as np
@@ -15,9 +19,14 @@ from transformers import AutoTokenizer
 
 from go1.internvl.model.go1 import GO1Model, GO1ModelConfig
 from go1.internvl.train.constants import IMG_END_TOKEN
-from go1.internvl.train.dataset import build_transform, dynamic_preprocess, preprocess_internvl2_5
+from go1.internvl.train.dataset import (
+    build_transform,
+    dynamic_preprocess,
+    preprocess_internvl2_5,
+)
 
 json_numpy.patch()
+msgnp.patch()
 
 
 def normalize(data, stats):
@@ -80,7 +89,10 @@ def multi_image_get_item(
     num_image_tokens = [num_image_token * num_tile for num_tile in num_tiles]
     ntp_target = raw_target.get("ntp_target", "")
     conversation = [
-        {"from": "human", "value": f"{'<image>'*num_image}{raw_target['final_prompt']}"},
+        {
+            "from": "human",
+            "value": f"{'<image>' * num_image}{raw_target['final_prompt']}",
+        },
         {"from": "gpt", "value": ntp_target},
     ]
     ret = preprocess_internvl2_5(
@@ -96,7 +108,9 @@ def multi_image_get_item(
     position_ids = ret["attention_mask"].long().cumsum(-1) - 1
     position_ids.masked_fill_(ret["attention_mask"] == 0, 1)
     image_end_token_id = text_tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
-    assert (ret["input_ids"][0] == image_end_token_id).sum() == num_image, "image tokens are truncated"
+    assert (ret["input_ids"][0] == image_end_token_id).sum() == num_image, (
+        "image tokens are truncated"
+    )
 
     # Create the final return dictionary
     final_ret = dict(
@@ -116,7 +130,9 @@ class GO1Infer:
         model_path: Union[str, Path],
         data_stats_path: Union[str, Path] = None,
     ) -> Path:
-        self.device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
 
         self.config = GO1ModelConfig.from_pretrained(
             model_path,
@@ -126,7 +142,8 @@ class GO1Infer:
         )
         self.image_size = self.config.force_image_size
         self.num_image_token: int = int(
-            (self.image_size // self.config.vision_config.patch_size) ** 2 * (self.config.downsample_ratio**2)
+            (self.image_size // self.config.vision_config.patch_size) ** 2
+            * (self.config.downsample_ratio**2)
         )
         self.dynamic_image_size = self.config.dynamic_image_size
 
@@ -134,7 +151,9 @@ class GO1Infer:
         self.go1.to(torch.bfloat16).to(self.device)
 
         self.img_transform = build_transform(
-            is_train=False, input_size=self.image_size, pad2square=self.config.pad2square
+            is_train=False,
+            input_size=self.image_size,
+            pad2square=self.config.pad2square,
         )
         self.text_tokenizer = AutoTokenizer.from_pretrained(
             model_path, add_eos_token=False, trust_remote_code=True, use_fast=False
@@ -142,7 +161,9 @@ class GO1Infer:
 
         self.norm = getattr(self.config, "norm", False)
         if self.norm:
-            assert data_stats_path is not None, "data_stats_path must be provided when norm is True"
+            assert data_stats_path is not None, (
+                "data_stats_path must be provided when norm is True"
+            )
             with open(data_stats_path, "rb") as f:
                 self.data_stats = get_stats_tensor(json.load(f))
 
@@ -157,7 +178,13 @@ class GO1Infer:
         state = inputs["state"]
         # Normalize state if needed
         if self.norm:
-            state = normalize(state, self.data_stats["state"])
+            state = normalize(
+                state,
+                {
+                    k: v[[[0, 1, 2, 3, 4, 5, -1], ...]]
+                    for k, v in self.data_stats["state"].items()
+                },
+            )
 
         start_time = time.time()
         device = self.device
@@ -169,9 +196,11 @@ class GO1Infer:
                 position_ids=position_ids.to(device).unsqueeze(0),
                 image_flags=image_flags.to(device),
                 state=state.to(dtype=torch.bfloat16, device=device).unsqueeze(0),
-                ctrl_freqs=ctrl_freqs.to(dtype=torch.bfloat16, device=device).unsqueeze(0),
+                ctrl_freqs=ctrl_freqs.to(dtype=torch.bfloat16, device=device).unsqueeze(
+                    0
+                ),
             )
-        print(f"Model inference time: {(time.time() - start_time)*1000:.3f} ms")
+        print(f"Model inference time: {(time.time() - start_time) * 1000:.3f} ms")
         outputs = action[1][0].float().cpu()
 
         # Unnormalize action if needed
@@ -216,7 +245,7 @@ class GO1Server:
         self,
         model_path: Union[str, Path],
         data_stats_path: Union[str, Path] = None,
-    ) -> Path:
+    ) -> None:
         self.model = GO1Infer(
             model_path=model_path,
             data_stats_path=data_stats_path,
@@ -225,12 +254,59 @@ class GO1Server:
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
         self.app = FastAPI()
 
+        # @self.app.exception_handler(Exception)
+        # async def global_exception_handler(request: Request, exc: Exception):
+        #     import traceback
+
+        #     error_trace = traceback.format_exc()
+        #     print(f"⚠️ 500 ERROR: {str(exc)}\n{error_trace}")
+        #     return JSONResponse(
+        #         status_code=500,
+        #         content={
+        #             "error": str(exc),
+        #             "trace": error_trace[:500],
+        #         },  # 限制长度避免过长
+        #     )
+
         @self.app.post("/act")
         async def act_endpoint(request: Request):
-            payload = await request.json()
-            actions = self.model.inference(payload)
+            try:
+                # 1. 读取二进制请求体
+                body = await request.body()
 
-            return actions.tolist() if hasattr(actions, "tolist") else actions
+                # 2. 使用 msgpack 解包（自动还原 numpy 数组）
+                payload = msgpack.unpackb(body, raw=False)
+
+                # 3. 调用模型推理
+                actions = self.model.inference(payload)
+
+                # 4. 确保返回 numpy 数组
+                if not isinstance(actions, np.ndarray):
+                    if hasattr(actions, "cpu"):  # torch.Tensor
+                        actions = actions.cpu().numpy()
+                    elif isinstance(actions, list):
+                        actions = np.array(actions)
+
+                # 5. 使用 msgpack 打包响应
+                packed_response = msgpack.packb(actions, use_bin_type=True)
+
+                # 6. 返回二进制响应
+                return Response(
+                    content=packed_response, media_type="application/msgpack"
+                )
+
+            except Exception as e:
+                import traceback
+
+                _trace = traceback.format_exc()
+                print(f"⚠️ 500 ERROR: {str(e)}\n{_trace}")
+                # 错误也用 msgpack 返回
+                error_response = msgpack.packb({"error": str(e)}, use_bin_type=True)
+                return Response(
+                    content=error_response,
+                    status_code=500,
+                    media_type="application/msgpack",
+                )
 
         uvicorn.run(self.app, host=host, port=port)
 

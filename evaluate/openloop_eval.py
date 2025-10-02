@@ -44,7 +44,7 @@ def plot_line(result_list, model_path, save_path):
 
 
 def main():
-    model_path = "/path/to/your/checkpoint"  # Update this to your model path
+    model_path = "/home/ps/Projects/AgiBot-World/experiment/lxy_test_001/checkpoint-13000"  # Update this to your model path
     exp_path = model_path.rsplit("/", 1)[0]
 
     if exp_path not in sys.path:
@@ -63,7 +63,13 @@ def main():
     ds = WrappedLeRobotDataset(
         root=dataset_args.data_root_dir,
         action_chunk_size=model.config.action_chunk_size,
-        transforms=None,
+        transforms=[
+            dict(
+                type="SelectDim",
+                key="observation.state",
+                index=([0, 1, 2, 3, 4, 5, -1], ...),
+            ),
+        ],
         text_tokenizer=model.text_tokenizer,
         num_image_token=model.num_image_token,
         image_size=model.image_size,
