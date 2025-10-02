@@ -329,13 +329,27 @@ def build_go1_model(dataset_args, model_args, training_args, space_args):
         )
         config.latent_planning = model_args.latent_planning
 
-    model = GO1Model.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        torch_dtype=torch_dtype,
-        _fast_init=get_bool_env(name="DEBUG_MODE"),
-        ignore_mismatched_sizes=True,
-    )
+    if model_args.action_generation_mode in ["flow_matching", "meanflow"]:
+        from go1.internvl.model.go1 import GO1ModelFlowMatching
+
+        config.flow_matching_config = model_args.flow_matching_config
+        config.action_generation_mode = model_args.action_generation_mode
+
+        model = GO1ModelFlowMatching.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            torch_dtype=torch_dtype,
+            _fast_init=get_bool_env(name="DEBUG_MODE"),
+            ignore_mismatched_sizes=True,
+        )
+    else:
+        model = GO1Model.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            torch_dtype=torch_dtype,
+            _fast_init=get_bool_env(name="DEBUG_MODE"),
+            ignore_mismatched_sizes=True,
+        )
 
     assert model.config.downsample_ratio == model_args.down_sample_ratio
     patch_size = model.config.vision_config.patch_size

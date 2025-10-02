@@ -22,6 +22,8 @@ class GO1ModelConfig(PretrainedConfig):
         action_config=None,
         latent_planner_config=None,
         noise_scheduler_config=None,
+        flow_matching_config=None,  # 新增: Flow Matching 配置
+        action_generation_mode="diffusion",  # 新增: 模式选择
         use_backbone_lora=0,
         use_llm_lora=0,
         pad2square=False,
@@ -42,11 +44,15 @@ class GO1ModelConfig(PretrainedConfig):
 
         if vision_config is None:
             vision_config = {}
-            logger.info("vision_config is None. Initializing the InternVisionConfig with default values.")
+            logger.info(
+                "vision_config is None. Initializing the InternVisionConfig with default values."
+            )
 
         if llm_config is None:
             llm_config = {}
-            logger.info("llm_config is None. Initializing the LlamaConfig config with default values (`LlamaConfig`).")
+            logger.info(
+                "llm_config is None. Initializing the LlamaConfig config with default values (`LlamaConfig`)."
+            )
 
         if action_config is None:
             action_config = {}
@@ -62,7 +68,9 @@ class GO1ModelConfig(PretrainedConfig):
 
         if noise_scheduler_config is None:
             noise_scheduler_config = {}
-            logger.info("noise_scheduler_config is None. Initializing the Schedulur config with `None`.")
+            logger.info(
+                "noise_scheduler_config is None. Initializing the Schedulur config with `None`."
+            )
 
         self.vision_config = InternVisionConfig(**vision_config)
         try:
@@ -77,11 +85,15 @@ class GO1ModelConfig(PretrainedConfig):
             self.action_config = ActionExpertConfig()
         try:
             if latent_planner_config["architectures"][0] == "ActionExpertModel":
-                self.latent_planner_config = LatentPlannerConfig(**latent_planner_config)
+                self.latent_planner_config = LatentPlannerConfig(
+                    **latent_planner_config
+                )
         except:
             self.latent_planner_config = LatentPlannerConfig()
 
         self.noise_scheduler_config = noise_scheduler_config
+        self.flow_matching_config = flow_matching_config  # 新增
+        self.action_generation_mode = action_generation_mode  # 新增
         self.use_backbone_lora = use_backbone_lora
         self.use_llm_lora = use_llm_lora
         self.pad2square = pad2square
@@ -126,4 +138,6 @@ class GO1ModelConfig(PretrainedConfig):
         output["norm"] = self.norm
         output["latent_planning"] = self.latent_planning
         output["action_chunk_size"] = self.action_chunk_size
+        output["flow_matching_config"] = self.flow_matching_config  # 新增
+        output["action_generation_mode"] = self.action_generation_mode  # 新增
         return output

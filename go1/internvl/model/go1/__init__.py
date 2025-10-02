@@ -2,6 +2,7 @@ from .configuration_action_expert import ActionExpertConfig
 from .configuration_go1 import GO1ModelConfig
 from .modeling_action_expert import ActionExpertModel
 from .modeling_go1 import GO1Model
+from .modeling_go1_flow_matching import GO1ModelFlowMatching
 from .modeling_internlm2_go1 import InternLM2ForCausalLMGO1
 
 __all__ = [
@@ -9,5 +10,6 @@ __all__ = [
     "GO1ModelConfig",
     "ActionExpertModel",
     "GO1Model",
+    "GO1ModelFlowMatching",
     "InternLM2ForCausalLMGO1",
 ]
