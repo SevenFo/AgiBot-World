@@ -22,6 +22,21 @@ import torch
 import torch.distributed as dist
 import transformers
 from accelerate import PartialState
+
+# Fix for PyTorch 2.6+ weights_only=True default
+# Monkey patch torch.load to always use weights_only=False for DeepSpeed checkpoints
+_original_torch_load = torch.load
+
+
+def _patched_torch_load(*args, **kwargs):
+    # Force weights_only=False if not explicitly set
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+    return _original_torch_load(*args, **kwargs)
+
+
+torch.load = _patched_torch_load
+
 from PIL import Image, ImageFile, PngImagePlugin
 from transformers import AutoTokenizer, Trainer, TrainingArguments, set_seed
 from transformers.trainer_utils import get_last_checkpoint

@@ -65,7 +65,7 @@ class GOModelArguments(BaseModelArguments):
 @dataclass
 class GOTrainingArguments(TrainingArguments):
     output_dir: str = field(default=f"experiment/{RUNNAME}")
-    overwrite_output_dir: bool = field(default=RESUME)
+    overwrite_output_dir: bool = field(default=RESUME is False)
     dataloader_num_workers: int = field(default=8 if not DEBUG_MODE else 0)  # 20
     bf16: bool = field(default=True)
     num_train_epochs: float = field(default=200.0)
