@@ -20,6 +20,7 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import transformers
 from accelerate import PartialState
 
@@ -39,6 +40,7 @@ torch.load = _patched_torch_load
 
 from PIL import Image, ImageFile, PngImagePlugin
 from transformers import AutoTokenizer, Trainer, TrainingArguments, set_seed
+from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (
     enable_default_handler,
@@ -84,6 +86,86 @@ warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+
+class GO1Trainer(Trainer):
+    """
+    自定义 Trainer,用于记录 action_loss_unweighted 等额外指标
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        重写 compute_loss 来记录额外的指标
+        """
+        # 调用模型,强制返回 dict
+        outputs = model(**inputs, return_dict=True)
+
+        # 获取主 loss
+        loss = outputs.loss
+
+        return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """
+        重写 training_step 来记录额外的指标
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # 调用 compute_loss 并获取 outputs
+        with self.compute_loss_context_manager():
+            loss, outputs = self.compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        # 反向传播
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+
+        kwargs = {}
+        if self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
+
+        self.accelerator.backward(loss, **kwargs)
+
+        if hasattr(outputs, "action_loss") and outputs.action_loss is not None:
+            self.store_metrics(
+                {"train/action_loss": outputs.action_loss.detach().cpu().item()}
+            )
+
+        if (
+            hasattr(outputs, "action_loss_unweighted")
+            and outputs.action_loss_unweighted is not None
+        ):
+            self.store_metrics(
+                {
+                    "train/action_loss_unweighted": outputs.action_loss_unweighted.detach()
+                    .cpu()
+                    .item()
+                }
+            )
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+    def store_metrics(self, metrics, smoothing=True):
+        """
+        存储指标供后续日志记录
+        """
+        if not hasattr(self, "_stored_metrics"):
+            self._stored_metrics = {}
+        self._stored_metrics.update(metrics)
+
+    def log(self, logs):
+        """
+        重写 log 方法,添加存储的指标
+        """
+        if hasattr(self, "_stored_metrics"):
+            logs.update(self._stored_metrics)
+            self._stored_metrics = {}
+        super().log(logs)
 
 
 def setup_debug_distributed():
@@ -260,6 +342,140 @@ def get_config_args(cfg_path: str):
         cfg.GOTrainingArguments(),
         cfg.SpaceArguments(),
     )
+
+
+class OpenLoopEvalCallback(TrainerCallback):
+    """
+    在训练过程中定期进行 OpenLoop Evaluation
+
+    和训练时的 forward 不同：
+    - 训练: 给定 clean data + noise → 预测 noise/velocity → 计算 loss
+    - OpenLoop Eval: 从纯噪声开始 → 逐步降噪/积分 → 生成 action → 和 GT 对比
+    """
+
+    def __init__(
+        self,
+        eval_dataset,
+        eval_steps=1000,
+        num_eval_samples=100,
+        tokenizer=None,
+        output_dir=None,
+    ):
+        """
+        Args:
+            eval_dataset: 评估数据集
+            eval_steps: 每隔多少步进行一次评估
+            num_eval_samples: 每次评估使用多少样本
+            tokenizer: tokenizer（用于数据处理）
+            output_dir: 输出目录（保存评估结果）
+        """
+        self.eval_dataset = eval_dataset
+        self.eval_steps = eval_steps
+        self.num_eval_samples = num_eval_samples
+        self.tokenizer = tokenizer
+        self.output_dir = output_dir
+        self.best_mse = float("inf")
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """每个 step 结束后检查是否需要评估"""
+        if state.global_step % self.eval_steps != 0:
+            return
+
+        if model is None:
+            return
+
+        # 只在主进程上评估
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info(f"\n{'=' * 80}")
+            logger.info(f"🔍 OpenLoop Evaluation at Step {state.global_step}")
+            logger.info(f"{'=' * 80}")
+
+            model.eval()
+            mse_list = []
+            mae_list = []
+
+            # 随机采样评估样本
+            num_samples = min(self.num_eval_samples, len(self.eval_dataset))
+            indices = np.random.choice(
+                len(self.eval_dataset), num_samples, replace=False
+            )
+            # 转换为 Python int list (HuggingFace datasets 不接受 numpy.int64)
+            indices = [int(idx) for idx in indices]
+
+            with torch.no_grad():
+                for idx in indices:
+                    sample = self.eval_dataset[idx]
+
+                    # 准备输入数据（参考 deploy.py 的 predict_action 函数）
+                    device = next(model.parameters()).device
+
+                    # 从 sample 中提取所有必需字段
+                    pixel_values = sample["pixel_values"]  # [num_patches, 3, H, W]
+                    input_ids = sample["input_ids"]  # [seq_len]
+                    attention_mask = sample["attention_mask"]  # [seq_len]
+                    position_ids = sample["position_ids"]  # [seq_len]
+                    image_flags = sample["image_flags"]  # [num_patches]
+                    robot_state = sample["state"]  # [state_dim] - 改名避免冲突!
+                    ctrl_freqs = sample["ctrl_freqs"]  # scalar or [1]
+                    gt_action = sample["action_gts"]  # [H, action_dim]
+
+                    outputs = model(
+                        pixel_values=pixel_values.to(dtype=model.dtype, device=device),
+                        input_ids=input_ids.to(device).unsqueeze(0),
+                        attention_mask=attention_mask.to(device).unsqueeze(0),
+                        position_ids=position_ids.to(device).unsqueeze(0),
+                        image_flags=image_flags.to(device),
+                        state=robot_state.to(
+                            dtype=model.dtype, device=device
+                        ).unsqueeze(0),
+                        ctrl_freqs=ctrl_freqs.to(
+                            dtype=model.dtype, device=device
+                        ).unsqueeze(0),
+                        return_dict=True,
+                    )
+
+                    pred_action = outputs.action_logits[0]  # [H, action_dim]
+                    gt_action = gt_action.to(device)
+
+                    # 计算误差
+                    mse = F.mse_loss(pred_action, gt_action).item()
+                    mae = F.l1_loss(pred_action, gt_action).item()
+
+                    mse_list.append(mse)
+                    mae_list.append(mae)
+
+            # 计算平均指标
+            avg_mse = np.mean(mse_list)
+            avg_mae = np.mean(mae_list)
+
+            logger.info("📊 OpenLoop Evaluation Results:")
+            logger.info(f"  - Average MSE: {avg_mse:.6f}")
+            logger.info(f"  - Average MAE: {avg_mae:.6f}")
+            logger.info(f"  - Samples Evaluated: {num_samples}")
+
+            # 记录到 wandb/tensorboard
+            if state.is_world_process_zero:
+                # Trainer 会自动处理日志
+                control.should_log = True
+
+            # 保存最佳模型
+            if avg_mse < self.best_mse:
+                self.best_mse = avg_mse
+                logger.info(
+                    f"✅ New best MSE: {avg_mse:.6f} (previous: {self.best_mse:.6f})"
+                )
+
+                if self.output_dir is not None:
+                    best_model_dir = os.path.join(
+                        self.output_dir, "best_openloop_model"
+                    )
+                    model.save_pretrained(best_model_dir)
+                    logger.info(f"💾 Saved best model to {best_model_dir}")
+
+            logger.info(f"{'=' * 80}\n")
+            model.train()
+
+        return control
 
 
 def build_go1_model(dataset_args, model_args, training_args, space_args):
@@ -498,20 +714,50 @@ def main(
     )
     logger.info(f"Train dataset {cfg} initialized!")
 
+    # 🔥 创建 OpenLoop Evaluation Dataset
+    # 使用训练集的一个子集进行评估（或者你可以指定单独的验证集）
+    eval_dataset = build_datasets(
+        tokenizer,
+        model.num_image_token,
+        dataset_args=dataset_args,
+        model_args=model_args,
+        is_train=False,  # 或者设置为 True 使用训练集子集
+        space_args=space_args,
+        stats_save_path=None,  # eval dataset 不需要保存 stats
+    )
+    logger.info("Eval dataset for OpenLoop evaluation initialized!")
+
     # Set seed for torch dataloaders
     set_seed(training_args.seed)
+
+    # 🔥 创建 OpenLoop Evaluation Callback
+    openloop_callback = OpenLoopEvalCallback(
+        eval_dataset=eval_dataset,
+        eval_steps=getattr(
+            model_args, "openloop_eval_steps", 1000
+        ),  # 从配置读取，默认 1000 步
+        num_eval_samples=getattr(
+            model_args, "openloop_eval_samples", 100
+        ),  # 默认 100 个样本
+        tokenizer=tokenizer,
+        output_dir=training_args.output_dir,
+    )
+    logger.info(
+        f"OpenLoop Evaluation Callback created (eval_steps={openloop_callback.eval_steps})"
+    )
 
     # Trianer initialization
     collator = functools.partial(
         concat_pad_data_collator_go1, pad_id=tokenizer.pad_token_id
     )
 
-    trainer = Trainer(
+    trainer = GO1Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         processing_class=tokenizer,
         data_collator=collator,
+        callbacks=[openloop_callback],  # 🔥 添加 callback
     )
 
     if dist.get_rank() == 0:
@@ -557,7 +803,7 @@ def main(
         metrics = train_result.metrics
         try:
             metrics["train_samples"] = len(train_dataset)
-        except:
+        except Exception:
             metrics["train_samples"] = -1
 
         trainer.log_metrics("train", metrics)

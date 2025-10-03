@@ -40,6 +40,7 @@ class ActionModelOutputWithPast(ModelOutput):
     action_loss: Optional[torch.FloatTensor] = None
     action_logits: Optional[torch.FloatTensor] = None
     action_gts: Optional[torch.FloatTensor] = None
+    action_loss_unweighted: Optional[torch.FloatTensor] = None
 
 
 class TimestepEmbedder(nn.Module):

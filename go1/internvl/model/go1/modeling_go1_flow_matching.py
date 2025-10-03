@@ -27,13 +27,21 @@ class FlowMatchingConfig:
     """Flow Matching 配置"""
 
     num_train_timesteps: int = 1000  # 训练时的时间分辨率（用于归一化）
-    num_inference_steps: int = 1  # 推理步数（1 表示单步生成）
+    num_inference_steps: int = 5  # 推理步数（1 表示单步生成）
     time_sampling: str = "uniform"  # 时间采样策略: uniform, logit_normal
     sigma_min: float = 0.0  # 最小噪声水平
 
     # MeanFlow 相关（可选）
     enable_meanflow: bool = False  # 是否启用 MeanFlow
-    data_proportion: float = 0.75  # MeanFlow 中 r=t 的比例
+    data_proportion: float = 0.25  # MeanFlow 中 r=t 的比例
+
+    # MeanFlow 自适应权重
+    norm_p: float = 1.0  # 自适应权重的指数
+    norm_eps: float = 0.01  # 自适应权重的 epsilon
+
+    # Logit-normal 时间采样参数
+    P_mean: float = -0.4  # logit_normal 的均值
+    P_std: float = 1.0  # logit_normal 的标准差
 
     def to_dict(self):
         return {
@@ -43,6 +51,10 @@ class FlowMatchingConfig:
             "sigma_min": self.sigma_min,
             "enable_meanflow": self.enable_meanflow,
             "data_proportion": self.data_proportion,
+            "norm_p": self.norm_p,
+            "norm_eps": self.norm_eps,
+            "P_mean": self.P_mean,
+            "P_std": self.P_std,
         }
 
 
@@ -69,9 +81,10 @@ class GO1ModelFlowMatching(GO1Model):
         from .modeling_go1 import TimestepEmbedder
 
         self.h_embedder = TimestepEmbedder(
-            config.hidden_size, frequency_embedding_size=256, dtype=torch.bfloat16
+            config.action_config.hidden_size, dtype=self.torch_dtype
         )
-        # 初始化权重（与 time_embedder 相同）
+
+        # 总是初始化新添加的 h_embedder (因为它不在父类中)
         torch.nn.init.normal_(self.h_embedder.mlp[0].weight, std=0.02)
         torch.nn.init.normal_(self.h_embedder.mlp[2].weight, std=0.02)
 
@@ -181,7 +194,7 @@ class GO1ModelFlowMatching(GO1Model):
         ctrl_freqs: int,
         vlm_key_values_downsample: list,
         attention_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         使用 JVP 计算 MeanFlow 损失
 
@@ -201,7 +214,8 @@ class GO1ModelFlowMatching(GO1Model):
 
         Returns:
             u_pred: [B, H, D] 预测的平均速度
-            action_loss: 标量损失
+            action_loss: 标量损失 (加权后)
+            action_loss_unweighted: 标量损失 (原始未加权)
         """
         import torch.func as func
 
@@ -265,8 +279,8 @@ class GO1ModelFlowMatching(GO1Model):
         # tangent for t: 1.0 (时间导数 dt/dt = 1)
         # tangent for r: 0.0 (r 是常数，dr/dt = 0)
         tangent_z = v_target
-        tangent_t = torch.ones_like(t)
-        tangent_r = torch.zeros_like(r)
+        tangent_t = torch.ones_like(t, dtype=z_t.dtype)  # 保持与模型相同的dtype
+        tangent_r = torch.zeros_like(r, dtype=z_t.dtype)  # 保持与模型相同的dtype
 
         # 计算 JVP: (u, du/dt)
         # JVP 计算: d/dλ u(z_t + λ*v_target, t + λ*1, r + λ*0) |_{λ=0}
@@ -281,7 +295,9 @@ class GO1ModelFlowMatching(GO1Model):
 
         # 构造 MeanFlow 目标
         # u_target = v - (t-r) * du/dt
-        time_diff = torch.clamp(t - r, min=0.0, max=1.0)  # [B, 1, 1]
+        time_diff = torch.clamp(t - r, min=0.0, max=1.0).to(
+            dtype=z_t.dtype
+        )  # [B, 1, 1] 保持dtype一致
         u_target = v_target - time_diff * du_dt
 
         # 停止梯度（target 不需要梯度）
@@ -292,19 +308,29 @@ class GO1ModelFlowMatching(GO1Model):
         loss_per_sample = F.mse_loss(u_pred, u_target, reduction="none")
         loss_per_sample = loss_per_sample.sum(dim=(1, 2))  # sum over H, D
 
+        # 保持与输入相同的dtype
+        loss_per_sample = loss_per_sample.to(dtype=z_t.dtype)
+
+        # 📊 保存原始未加权的 loss (用于监控)
+        action_loss_unweighted = loss_per_sample.mean()
+
         # 应用自适应权重 (Adaptive Weighting)
         # MeanFlow paper: loss = loss / (loss + eps)^p
         norm_p = getattr(self.fm_config, "norm_p", 1.0)
         norm_eps = getattr(self.fm_config, "norm_eps", 0.01)
 
         if norm_p > 0:
-            adaptive_weight = torch.pow(loss_per_sample + norm_eps, norm_p)
+            # 确保 norm_eps 是正确的 dtype
+            norm_eps_tensor = torch.tensor(
+                norm_eps, dtype=loss_per_sample.dtype, device=loss_per_sample.device
+            )
+            adaptive_weight = torch.pow(loss_per_sample + norm_eps_tensor, norm_p)
             loss_per_sample = loss_per_sample / adaptive_weight.detach()
 
-        # 最终损失：batch 平均
+        # 最终损失：batch 平均 (加权后)
         action_loss = loss_per_sample.mean()
 
-        return u_pred, action_loss
+        return u_pred, action_loss, action_loss_unweighted
 
     def forward(
         self,
@@ -372,29 +398,18 @@ class GO1ModelFlowMatching(GO1Model):
                 t = self.sample_time(B, device)
 
             # 2. 采样噪声 x_1 ~ N(0, I)
-            x_1 = torch.randn_like(action_gts)
+            x_1 = torch.randn_like(action_gts, dtype=self.torch_dtype)
 
             # 3. 线性插值 z_t = (1-t)x_0 + t*x_1
-            x_0 = action_gts
+            x_0 = action_gts.to(self.torch_dtype)
+            t = t.to(self.torch_dtype)
+
             z_t = self.linear_interpolation(x_0, x_1, t)
 
             # 4. 计算目标速度 v_target = x_1 - x_0
             v_target = self.compute_velocity_target(x_0, x_1)
 
-            # 5. 准备模型输入
-            # 将 t 从 [0, 1] 缩放到 [0, num_train_timesteps] 用于 embedding
-            t_scaled = t.squeeze(-1) * self.fm_config.num_train_timesteps
-            timestep_tokens = self.time_embedder(t_scaled)  # [B, 1, C]
-            freq_tokens = self.freq_embedder(ctrl_freqs)  # [B, 1, C]
-
-            state_trajs = self.state_adaptor(state)  # [B, 1, C]
-            action_trajs = self.action_adaptor(z_t)  # [B, H, C]
-
-            state_action_trajs_w_tfps = torch.cat(
-                [timestep_tokens, freq_tokens, state_trajs, action_trajs], dim=1
-            )  # [B, H+3, C]
-
-            # 6. Action expert 前向传播
+            # 5. 准备 LAM attention mask (如果启用)
             if self.enable_lam:
                 vlm_key_values_downsample = latent_vlm_key_values_downsample
                 attention_mask_extended = torch.cat(
@@ -412,23 +427,15 @@ class GO1ModelFlowMatching(GO1Model):
             else:
                 attention_mask_extended = attention_mask
 
-            model_output = self.action_model(
-                state_action_trajs_w_tfps,
-                attention_mask_extended,
-                vlm_key_values_downsample,
-            )
-
-            # 7. 提取 action 输出
-            state_action_output_tokens = model_output[0]
-            action_output_tokens = state_action_output_tokens[
-                :, -self.action_chunk_size :, ...
-            ]
-            v_pred = self.final_layer(action_output_tokens)  # [B, H, action_dim]
-
-            # 8. 计算损失
+            # 6. 根据模式选择不同的计算路径
             if self.fm_config.enable_meanflow and r is not None:
-                # MeanFlow 损失：使用 JVP 计算 du/dt
-                action_logits, action_loss = self.compute_meanflow_loss_with_jvp(
+                # ==================== MeanFlow 模式 ====================
+                # 直接交给 JVP 函数处理所有 embedding 和前向传播
+                (
+                    action_logits,
+                    action_loss,
+                    action_loss_unweighted,
+                ) = self.compute_meanflow_loss_with_jvp(
                     z_t=z_t,
                     t=t,
                     r=r,
@@ -439,8 +446,37 @@ class GO1ModelFlowMatching(GO1Model):
                     attention_mask=attention_mask_extended,
                 )
             else:
-                # 基础 Flow Matching 损失
+                # ==================== 基础 Flow Matching 模式 ====================
+                # 准备模型输入 (只需要 t embedding，不需要 h)
+                t_scaled = t.squeeze(-1) * self.fm_config.num_train_timesteps
+                timestep_tokens = self.time_embedder(t_scaled)  # [B, 1, C]
+
+                freq_tokens = self.freq_embedder(ctrl_freqs)  # [B, 1, C]
+
+                state_trajs = self.state_adaptor(state)  # [B, 1, C]
+                action_trajs = self.action_adaptor(z_t)  # [B, H, C]
+
+                state_action_trajs_w_tfps = torch.cat(
+                    [timestep_tokens, freq_tokens, state_trajs, action_trajs], dim=1
+                )  # [B, H+3, C]
+
+                # 前向传播
+                model_output = self.action_model(
+                    state_action_trajs_w_tfps,
+                    attention_mask_extended,
+                    vlm_key_values_downsample,
+                )
+
+                # 提取 action 输出
+                state_action_output_tokens = model_output[0]
+                action_output_tokens = state_action_output_tokens[
+                    :, -self.action_chunk_size :, ...
+                ]
+                v_pred = self.final_layer(action_output_tokens)  # [B, H, action_dim]
+
+                # 计算损失
                 action_loss = F.mse_loss(v_pred, v_target)
+                action_loss_unweighted = action_loss  # 基础 FM 没有加权
                 action_logits = v_pred
 
         else:
@@ -467,16 +503,22 @@ class GO1ModelFlowMatching(GO1Model):
                 attention_mask,
                 ctrl_freqs,
             )
+            action_loss_unweighted = None  # 推理时不计算 loss
+
+        loss = action_loss
 
         # 构造输出
         if not return_dict:
-            return (action_logits, action_loss, vlm_outputs)
+            return (loss, action_logits)
 
-        return ActionModelOutputWithPast(
+        output = ActionModelOutputWithPast(
+            loss=loss,
             action_logits=action_logits,
             action_loss=action_loss,
-            vlm_outputs=vlm_outputs,
+            action_gts=action_gts,
+            action_loss_unweighted=action_loss_unweighted,  # ✅ 添加未加权 loss
         )
+        return output
 
     def condition_sample_flow_matching(
         self,
@@ -486,9 +528,10 @@ class GO1ModelFlowMatching(GO1Model):
         ctrl_freqs: int = 30,
     ) -> torch.Tensor:
         """
-        Flow Matching 推理采样 (Euler 积分)
+        Flow Matching / MeanFlow 推理采样
 
-        从 z_1 (纯噪声) 积分到 z_0 (干净 action)
+        - Flow Matching: Euler 积分 (多步)
+        - MeanFlow: 直接跳转 (单步或多步)
 
         Args:
             state: [B, state_dim] 当前状态
@@ -510,43 +553,104 @@ class GO1ModelFlowMatching(GO1Model):
             dtype=dtype,
         )
 
-        # 2. 设置积分步长
+        # 2. 设置采样步数
         num_steps = self.fm_config.num_inference_steps
-        dt = 1.0 / num_steps
 
-        # 3. Euler 积分: 从 t=1 到 t=0
-        for i in range(num_steps):
-            t_current = 1.0 - i * dt  # 1.0, 0.9, 0.8, ..., 0.1 (如果 num_steps=10)
+        if self.fm_config.enable_meanflow:
+            # ==================== MeanFlow 采样 ====================
+            # 使用平均速度 u_θ(z_t, t, h) 进行直接跳转
+            # 默认: t_steps = [1.0, 0.0] (单步)
+            # 或多步: t_steps = [1.0, 0.5, 0.0] (2步)
 
-            # 准备时间 embedding
-            t_tensor = torch.full(
-                (B, 1),
-                t_current * self.fm_config.num_train_timesteps,
-                device=device,
-                dtype=dtype,
-            )
-            timestep_tokens = self.time_embedder(t_tensor)  # [B, 1, C]
-            freq_tokens = self.freq_embedder(ctrl_freqs)  # [B, 1, C]
+            dt = 1.0 / num_steps
+            for i in range(num_steps):
+                t_current = 1.0 - i * dt  # t: 1.0 → 0.0
+                r_current = 1.0 - (i + 1) * dt  # r: 0.0
+                h_current = t_current - r_current  # h = dt
 
-            # 准备 state & action embedding
-            action_traj = self.action_adaptor(z_t)  # [B, H, C]
-            state_action_trajs_w_tfps = torch.cat(
-                [timestep_tokens, freq_tokens, state_traj, action_traj], dim=1
-            )
+                # 准备时间 embedding (t)
+                t_tensor = torch.full(
+                    (B, 1),
+                    t_current * self.fm_config.num_train_timesteps,
+                    device=device,
+                    dtype=dtype,
+                )
+                timestep_tokens = self.time_embedder(t_tensor)  # [B, 1, C]
 
-            # 模型预测速度
-            model_output = self.action_model(
-                state_action_trajs_w_tfps,
-                attention_mask,
-                vlm_key_values_downsample,
-            )
+                # 准备时间差 embedding (h)
+                h_tensor = torch.full(
+                    (B, 1),
+                    h_current * self.fm_config.num_train_timesteps,
+                    device=device,
+                    dtype=dtype,
+                )
+                h_tokens = self.h_embedder(h_tensor)  # [B, 1, C]
 
-            action_output_tokens = model_output[0][:, -self.action_chunk_size :, ...]
-            v_pred = self.final_layer(action_output_tokens)  # [B, H, action_dim]
+                # 组合: c = t + h (MeanFlow 的关键)
+                combined_time_tokens = timestep_tokens + h_tokens  # [B, 1, C]
 
-            # Euler 步进: z_{t-dt} = z_t - dt * v_pred
-            z_t = z_t - dt * v_pred
-            z_t = z_t.to(dtype)
+                freq_tokens = self.freq_embedder(ctrl_freqs)  # [B, 1, C]
+                action_traj = self.action_adaptor(z_t)  # [B, H, C]
+
+                state_action_trajs_w_tfps = torch.cat(
+                    [combined_time_tokens, freq_tokens, state_traj, action_traj], dim=1
+                )
+
+                # 模型预测平均速度 u
+                model_output = self.action_model(
+                    state_action_trajs_w_tfps,
+                    attention_mask,
+                    vlm_key_values_downsample,
+                )
+
+                action_output_tokens = model_output[0][
+                    :, -self.action_chunk_size :, ...
+                ]
+                u_pred = self.final_layer(action_output_tokens)  # [B, H, action_dim]
+
+                # MeanFlow 步进: z_r = z_t - (t-r) * u
+                z_t = z_t - h_current * u_pred
+                z_t = z_t.to(dtype)
+
+        else:
+            # ==================== 基础 Flow Matching 采样 ====================
+            # 使用瞬时速度 v_θ(z_t, t) 进行 Euler 积分
+
+            dt = 1.0 / num_steps
+            for i in range(num_steps):
+                t_current = 1.0 - i * dt  # 1.0, 0.9, 0.8, ..., 0.1
+
+                # 准备时间 embedding (只有 t，没有 h)
+                t_tensor = torch.full(
+                    (B, 1),
+                    t_current * self.fm_config.num_train_timesteps,
+                    device=device,
+                    dtype=dtype,
+                )
+                timestep_tokens = self.time_embedder(t_tensor)  # [B, 1, C]
+                freq_tokens = self.freq_embedder(ctrl_freqs)  # [B, 1, C]
+
+                # 准备 state & action embedding
+                action_traj = self.action_adaptor(z_t)  # [B, H, C]
+                state_action_trajs_w_tfps = torch.cat(
+                    [timestep_tokens, freq_tokens, state_traj, action_traj], dim=1
+                )
+
+                # 模型预测瞬时速度 v
+                model_output = self.action_model(
+                    state_action_trajs_w_tfps,
+                    attention_mask,
+                    vlm_key_values_downsample,
+                )
+
+                action_output_tokens = model_output[0][
+                    :, -self.action_chunk_size :, ...
+                ]
+                v_pred = self.final_layer(action_output_tokens)  # [B, H, action_dim]
+
+                # Euler 步进: z_{t-dt} = z_t - dt * v_pred
+                z_t = z_t - dt * v_pred
+                z_t = z_t.to(dtype)
 
         return z_t  # 返回 z_0 (干净的 action)
 

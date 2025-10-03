@@ -108,11 +108,11 @@ class GOModelArguments(BaseModelArguments):
         metadata={"help": "Flow Matching 训练时的时间分辨率（用于归一化）"},
     )
     fm_num_inference_steps: int = field(
-        default=5,  # flow matching: 5, mean flow: 1
+        default=2,  # flow matching: 5, mean flow: 1
         metadata={"help": "Flow Matching 推理步数 (1=单步, 2-5=多步)"},
     )
     fm_time_sampling: str = field(
-        default="uniform",  # 可选: "uniform" 或 "logit_normal"
+        default="logit_normal",  # 可选: "uniform" 或 "logit_normal"
         metadata={"help": "Flow Matching 时间采样策略"},
     )
     fm_sigma_min: float = field(
@@ -121,7 +121,7 @@ class GOModelArguments(BaseModelArguments):
 
     # ===================== MeanFlow 特有配置 (mode=meanflow) =====================
     mf_enable: bool = field(
-        default=False,  # 设置为 True 启用 MeanFlow
+        default=True,  # 设置为 True 启用 MeanFlow
         metadata={"help": "是否启用 MeanFlow (平均速度学习)"},
     )
     mf_data_proportion: float = field(
@@ -173,10 +173,10 @@ class GOModelArguments(BaseModelArguments):
 class GOTrainingArguments(TrainingArguments):
     output_dir: str = field(default=f"experiment/{RUNNAME}")
     overwrite_output_dir: bool = field(default=RESUME is False)
-    dataloader_num_workers: int = field(default=8 if not DEBUG_MODE else 0)
+    dataloader_num_workers: int = field(default=4 if not DEBUG_MODE else 0)
     bf16: bool = field(default=True)
     num_train_epochs: float = field(default=400.0)
-    per_device_train_batch_size: int = field(default=32 if not DEBUG_MODE else 2)
+    per_device_train_batch_size: int = field(default=16 if not DEBUG_MODE else 2)
     gradient_accumulation_steps: int = field(default=1)
 
     learning_rate: float = field(default=1e-5)  # 原始 Diffusion 用 2e-5
@@ -188,7 +188,7 @@ class GOTrainingArguments(TrainingArguments):
     deepspeed: str = field(default="go1/zero_stage2_config.json")
 
     save_strategy: str = field(default="steps")
-    save_steps: int = field(default=5000)
+    save_steps: int = field(default=10000)
     save_total_limit: int = field(default=20)
     logging_steps: int = field(default=10)
     report_to: str = field(default="tensorboard")

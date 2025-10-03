@@ -8,7 +8,19 @@ WORLD_SIZE=${WORLD_SIZE:-1}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 RANK=${RANK:-0}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
-MASTER_PORT=${MASTER_PORT:-12345}
+
+# Auto-select available port if MASTER_PORT not set
+if [ -z "${MASTER_PORT+x}" ]; then
+    # Try default port first, then find random available port
+    MASTER_PORT=12345
+    if ss -tuln | grep -q ":${MASTER_PORT} "; then
+        echo "[WARNING] Port ${MASTER_PORT} is already in use, selecting random available port..."
+        MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+        echo "[INFO] Using port: ${MASTER_PORT}"
+    fi
+else
+    echo "[INFO] Using specified port: ${MASTER_PORT}"
+fi
 
 if [ -z "${RUNNAME+x}" ]; then  
     echo "[ERROR] RUNNAME is not set, please inject RUNNAME for experiment output directory" 
