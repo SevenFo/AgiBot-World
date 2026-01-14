@@ -53,7 +53,8 @@ dependencies = [
     "tyro",
     "uvicorn",
     "wandb",
-    "yacs"
+    "yacs",
+    "msgpack_numpy"
 ]
 
 [project.optional-dependencies]
